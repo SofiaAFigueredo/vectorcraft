@@ -795,11 +795,17 @@ impl Targets {
             let lines = if x { &self.xs } else { &self.ys };
             for r in rects {
                 let vs = if x { [r.x0, r.center().x, r.x1] } else { [r.y0, r.center().y, r.y1] };
-                let rulers = self.edge_rulers.iter().filter(|g| g.vertical == x).filter_map(|g| g.line_over(span(r, !x), tol));
+                let rulers = self.edge_rulers.iter().filter(|g| g.vertical == x).filter_map(|g| g.line_over(span(r, !x)));
                 let rulers: Vec<_> = rulers.collect();
                 for v in vs {
-                    for (t, from, _) in lines_near(lines, v, tol).iter().chain(&rulers).filter(|(t, ..)| (t - v).abs() <= tol) {
+                    let art = lines_near(lines, v, tol).iter().map(|l| (l, false));
+                    for ((t, from, _), ruler) in art.chain(rulers.iter().map(|l| (l, true))).filter(|((t, ..), _)| (t - v).abs() <= tol) {
                         let s = (t - v) / c;
+                        // A ruler guide runs the whole canvas, so a line nearly parallel to it would slide
+                        // the selection far to meet it: it pulls within the reach of a point's slide only.
+                        if ruler && s.abs() > 2.0 * tol {
+                            continue;
+                        }
                         if best.is_none_or(|b| s.abs() < b.0.abs()) {
                             best = Some((s, *t, *from, x));
                         }
@@ -936,7 +942,7 @@ impl Targets {
                 .flat_map(|r| along(r).into_iter().map(move |v| (v, *r)))
                 .flat_map(|(v, r)| {
                     // The ruler guides across this axis that run along the rectangle.
-                    let rulers = self.edge_rulers.iter().filter(move |g| g.vertical == x).filter_map(move |g| g.line_over(span(&r, !x), tol));
+                    let rulers = self.edge_rulers.iter().filter(move |g| g.vertical == x).filter_map(move |g| g.line_over(span(&r, !x)));
                     lines_near(targets, v, tol).iter().copied().chain(rulers).map(move |(t, from, _)| (t - v, from, v, r))
                 })
                 .filter(|(d, ..)| d.abs() <= tol)
