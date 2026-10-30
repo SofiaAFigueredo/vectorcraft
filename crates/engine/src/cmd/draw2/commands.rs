@@ -83,7 +83,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Knife",
             [],
             None,
-            "{points: [[x,y]…]} cut closed shapes (selected, or all when nothing is selected) along the polyline → {ids}",
+            "{points: [[x,y]…], fidelity?: pt} cut closed shapes (selected, or all when nothing is selected) along the polyline → {ids}. With `fidelity` the points are fitted to a smooth curve within that many points (as Pencil does) so a shaky drag cuts cleanly with few anchors; without it the cut follows the polyline exactly",
             has_doc,
             knife
         ),

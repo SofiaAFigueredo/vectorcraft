@@ -376,7 +376,7 @@ impl GestureTool {
                 "path.eraseRegion".into(),
                 json!({"points": points_json(pts), "size": self.size, "angle": self.angle, "roundness": self.roundness}),
             )],
-            "knife" if pts.len() >= 2 => vec![Action::Exec("path.knife".into(), json!({"points": points_json(pts)}))],
+            "knife" if pts.len() >= 2 => vec![Action::Exec("path.knife".into(), json!({"points": points_json(pts), "fidelity": self.fidelity}))],
             "smooth" if has_sel && pts.len() >= 2 => {
                 vec![Action::Exec("path.smoothRegion".into(), json!({"points": points_json(pts), "radius": tol, "fidelity": self.fidelity}))]
             }

@@ -224,14 +224,58 @@ pub(super) fn split(s: &mut Session, p: &Value) -> Result<Value> {
 /// Width of the slit the knife leaves between pieces.
 const KNIFE_GAP: f64 = 0.05;
 
+/// `pts` with the hand's jitter averaged out: each point becomes the average of the points within
+/// `reach` pt of it along the drag (nearer ones count more). The window is cut short near the ends,
+/// so the first and last point stay where they were.
+fn smooth_drag(pts: &[Point], reach: f64) -> Vec<Point> {
+    if !(reach.is_finite() && reach > 0.0) || pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut at = Vec::with_capacity(pts.len());
+    let mut run = 0.0;
+    for (i, p) in pts.iter().enumerate() {
+        if let Some(prev) = i.checked_sub(1).and_then(|j| pts.get(j)) {
+            run += prev.distance(*p);
+        }
+        at.push(run);
+    }
+    pts.iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            let half = reach.min(at[i]).min(run - at[i]);
+            if half <= 0.0 {
+                return p;
+            }
+            let (mut sum, mut w_sum) = (Vec2::ZERO, 0.0);
+            for (q, s) in pts.iter().zip(&at) {
+                let w = 1.0 - (s - at[i]).abs() / half;
+                if w > 0.0 {
+                    sum += q.to_vec2() * w;
+                    w_sum += w;
+                }
+            }
+            if w_sum > 0.0 { (sum / w_sum).to_point() } else { p }
+        })
+        .collect()
+}
+
 pub(super) fn knife(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "path.knife";
     let pts = points_param(p, "points", C)?;
     if pts.len() < 2 {
         return Err(bad(C, "need at least two points"));
     }
+    // With a `fidelity` the drag is fitted like a Pencil stroke: the hand's jitter doesn't become
+    // anchors on the edges of the cut.
+    let line = match p.get("fidelity") {
+        None | Some(Value::Null) => SubPath::polyline(&pts, false),
+        Some(_) => {
+            let tol = number_or(p, "fidelity", 1.5, C)?.clamp(vectorcraft_tools::draw2::MIN_FIDELITY, 100.0);
+            super::freehand::fit_freehand(&smooth_drag(&pts, tol * 2.0), tol, false)
+        }
+    };
     let st = s.doc()?;
-    let strip = po::outline_stroke(&PathData::single(SubPath::polyline(&pts, false)), KNIFE_GAP, Cap::Butt, Join::Round, 4.0);
+    let strip = po::outline_stroke(&PathData::single(line), KNIFE_GAP, Cap::Butt, Join::Round, 4.0);
     let mut plan: Vec<(NodeId, Vec<PathData>)> = vec![];
     for id in target_paths(&st.doc, &st.selection, poly_bounds(&pts, 1.0)) {
         let (pd, rule) = path_of(&st.doc, id)?;
