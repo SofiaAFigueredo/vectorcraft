@@ -33,6 +33,8 @@ mod mac_fonts;
 #[cfg(target_os = "macos")]
 mod mac_menu;
 #[cfg(target_os = "macos")]
+mod mac_print;
+#[cfg(target_os = "macos")]
 mod mac_save_format;
 #[cfg(target_os = "macos")]
 mod mac_screen_color;

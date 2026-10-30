@@ -1,9 +1,23 @@
 //! Desktop printer transport. VectorCraft composes every page and copy before submission;
 //! craft-print owns discovery and spooling.
+use crate::host_services::Parent;
 use std::process::Command;
 use vectorcraft_ui_egui::print::{PrintJob, PrintService, Printer};
 
-pub struct SystemPrint;
+/// The desktop's print service. It holds the app window, which the macOS print panel opens on as a
+/// sheet; without one (tests) there is no system panel.
+#[derive(Default)]
+pub struct SystemPrint {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    window: Parent,
+}
+
+impl SystemPrint {
+    pub fn new(window: Parent) -> Self {
+        Self { window }
+    }
+}
+
 impl PrintService for SystemPrint {
     fn printers(&mut self) -> Vec<Printer> {
         system::printers()
@@ -14,7 +28,7 @@ impl PrintService for SystemPrint {
         result.map(|note| format!("Sent “{}” to {to}{note}", job.title))
     }
     fn shared_print(&self) -> Option<vectorcraft_ui_egui::print::SharedPrintFn> {
-        Some(std::sync::Arc::new(|job| SystemPrint.print(job)))
+        Some(std::sync::Arc::new(|job| SystemPrint::default().print(job)))
     }
     fn turns_landscape(&self) -> bool {
         // macOS's `lp` doesn't turn a landscape page to the paper: it cuts it off on upright
@@ -26,6 +40,21 @@ impl PrintService for SystemPrint {
     }
     fn setup(&mut self, printer: Option<&str>) -> Result<(), String> {
         system::setup(printer)
+    }
+    fn has_system_panel(&self) -> bool {
+        cfg!(target_os = "macos") && self.window.is_some()
+    }
+    fn print_with_panel(&mut self, job: &PrintJob) -> Result<String, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let window = self.window.as_deref().ok_or("there is no window to show the print panel on")?;
+            crate::mac_print::show(window, job.title, job.pdf).map(|()| format!("Showing the system print panel for “{}”", job.title))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = job;
+            Err("the system print panel is only available on macOS".into())
+        }
     }
 }
 
@@ -128,10 +157,19 @@ mod tests {
 #[cfg(test)]
 mod turn_tests {
     use super::SystemPrint;
-    use vectorcraft_ui_egui::print::PrintService;
+    use vectorcraft_ui_egui::print::{PrintJob, PrintService};
 
     #[test]
     fn only_macos_queues_need_landscape_pages_turned() {
-        assert_eq!(SystemPrint.turns_landscape(), !cfg!(target_os = "macos"));
+        assert_eq!(SystemPrint::default().turns_landscape(), !cfg!(target_os = "macos"));
+    }
+
+    /// The system panel is a sheet on the app's window: without one there is no panel, and asking
+    /// for it answers with an error instead of showing anything.
+    #[test]
+    fn no_window_means_no_system_panel() {
+        let mut service = SystemPrint::default();
+        assert!(!service.has_system_panel());
+        assert!(service.print_with_panel(&PrintJob { printer: None, title: "art", pdf: b"%PDF-1.4" }).is_err());
     }
 }

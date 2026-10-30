@@ -1133,6 +1133,12 @@ pub const UI_COMMANDS: &[(&str, &str, &str, &str)] = &[
         "{} open the Print dialog (dialog `print`: the print.setup settings, preset (setting it loads that print preset; Save Preset… saves them as one), printer, toFile; Print keeps the settings with the document and prints, Done (discard: true) only keeps them); with params {preset? (a print preset's name: its settings instead of the document's), settings? (over the document's or the preset's), printer? (print.printers name; \"\" the default), toFile?, path?, format?: pdf|postscript, level?, flattenerPreset? (as engine file.print)} print without it: the print-ready PDF (engine file.print) goes to the printer → {pages, printer, printed: true, warnings}; with toFile, a path or no printing here (no print service) it is saved as a PDF at path (else a picked file, the web downloads it) → {path, pages, printed: false, warnings}; a PostScript file (format postscript, or a .ps path) is always saved that way",
     ),
     (
+        "file.printSystem",
+        "Print with System Dialog…",
+        "",
+        "{preset?, settings?} (as file.print's) lay the print job out as File → Print does (marks, bleed, color management) with one copy and show the system's own print panel for it, which has the printer driver's options: finishing, paper tray, color profile… (macOS; elsewhere the command is disabled and answers with an error). The panel is a sheet: the command returns once it is shown → {pages, panel: true, printed: false, warnings}",
+    ),
+    (
         "print.printers",
         "Printers",
         "",

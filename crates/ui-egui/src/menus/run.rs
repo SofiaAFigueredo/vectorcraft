@@ -808,6 +808,7 @@ fn run_ui_part12(app: &mut VectorcraftApp, id: &str, p: &Value) -> Option<Result
         // File → Print…: its dialog; with params, print (or save the job as a PDF) without it.
         "file.print" if p.as_object().is_none_or(|o| o.is_empty()) => crate::dialogs::print::open(app),
         "file.print" => crate::print::run(app, p),
+        "file.printSystem" => crate::print::run_system(app, p),
         "print.printers" => Ok(crate::print::printers(app)),
         "print.printerSetup" => {
             let printer = s("printer").filter(|n| !n.is_empty());

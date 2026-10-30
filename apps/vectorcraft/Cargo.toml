@@ -61,7 +61,7 @@ windows = { version = "0.62", features = ["Win32_Graphics_DirectWrite", "Win32_G
 # with default features off). Pinned exactly: review the diff before bumping.
 muda = { version = "=0.21.2", default-features = false }
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "objc2-quartz-core", "NSApplication", "NSButton", "NSColor", "NSColorSampler", "NSColorSpace", "NSControl", "NSMenu", "NSEvent", "NSPasteboard", "NSPopUpButton", "NSResponder", "NSSavePanel", "NSTextField", "NSTextInputContext", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "objc2-quartz-core", "NSApplication", "NSButton", "NSColor", "NSColorSampler", "NSColorSpace", "NSControl", "NSMenu", "NSEvent", "NSPasteboard", "NSPopUpButton", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSSavePanel", "NSTextField", "NSTextInputContext", "NSView", "NSWindow"] }
 # Files opened from Finder and the Dock (src/open_documents.rs), pasted bitmaps (src/clipboard.rs) and the control channel's App Nap activity (src/control_server.rs); both already come with winit, muda and rfd.
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSData", "NSGeometry", "NSNotification", "NSOperation", "NSProcessInfo", "NSString", "NSURL"] }
 block2 = "0.6"
@@ -77,6 +77,10 @@ objc2-core-text = { version = "0.3", default-features = false, features = ["std"
 # Zlib OR Apache-2.0 OR MIT, already in the build through wgpu with these features.
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CAMetalLayer"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColorSpace"] }
+# PDFKit's print operation for the print job's PDF (src/mac_print.rs, File → Print with System Dialog…,
+# #4728): the system's print panel with the printer driver's options. MIT OR Apache-2.0 OR Zlib, the
+# same objc2 family as above.
+objc2-pdf-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "PDFDocument"] }
 # Waits for the answer of a file dialog shown as a sheet (src/main.rs, #867). MIT OR Apache-2.0,
 # already in the build through eframe.
 pollster = "1"

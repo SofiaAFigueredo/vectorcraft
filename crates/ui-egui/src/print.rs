@@ -3,7 +3,8 @@
 //! `file.print` with settings sends the engine's print-ready PDF (`file.print` in the engine) to
 //! it, or saves the PDF when asked to (`toFile`, `path`) or when there is no print service; a
 //! PostScript file (`format: "postscript"`, or a `.ps` path) is always saved. `print.printers`
-//! lists the printers.
+//! lists the printers. `file.printSystem` lays the same job out and hands it to the platform's own
+//! print panel (macOS), which shows the printer driver's options.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -56,6 +57,17 @@ pub trait PrintService {
     fn setup(&mut self, _printer: Option<&str>) -> Result<(), String> {
         Err("there are no printer settings to open here".into())
     }
+    /// Whether [`Self::print_with_panel`] can show the system's own print panel, with the options
+    /// of the printer's driver (finishing, paper tray, color profile…). Only macOS has one.
+    fn has_system_panel(&self) -> bool {
+        false
+    }
+    /// Print with System Dialog…: show the system's print panel for `job` (a single copy, since the
+    /// panel decides the copies; `job.printer` is ignored, the panel picks it) → what happened, for
+    /// the status bar. The panel is a sheet, so this returns once it is shown, not once it closes.
+    fn print_with_panel(&mut self, _job: &PrintJob) -> Result<String, String> {
+        Err("there is no system print panel here".into())
+    }
 }
 
 /// `print.printers`: the system's printers, and what the print service offers.
@@ -100,10 +112,7 @@ pub fn run(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
     if app.services.print.as_ref().is_some_and(|s| !s.turns_landscape()) {
         q["forPrinter"] = json!(true);
     }
-    let mut v = app.session.execute("file.print", &q).map_err(|e| e.to_string())?;
-    let data = v.as_object_mut().and_then(|o| o.remove("dataBase64"));
-    let pdf = data.as_ref().and_then(Value::as_str).and_then(vectorcraft_format::base64_decode).ok_or("the print job has no data")?;
-    let title = app.session.active().map(|d| d.title()).unwrap_or_default();
+    let (mut v, pdf, title) = layout(app, &q)?;
     let printer = s("printer").filter(|n| !n.is_empty());
     let service = app.services.print.as_mut().ok_or("no print service")?;
     if let Some(submit) = service.shared_print() {
@@ -139,5 +148,45 @@ pub fn run(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
     app.status(done);
     v["printer"] = json!(printer);
     v["printed"] = json!(true);
+    Ok(v)
+}
+
+/// Lay the job `q` (the parameters of the engine's `file.print`) out → the engine's reply without
+/// the PDF, the print-ready PDF and the active document's title.
+fn layout(app: &mut VectorcraftApp, q: &Value) -> Result<(Value, Vec<u8>, String), String> {
+    let mut v = app.session.execute("file.print", q).map_err(|e| e.to_string())?;
+    let data = v.as_object_mut().and_then(|o| o.remove("dataBase64"));
+    let pdf = data.as_ref().and_then(Value::as_str).and_then(vectorcraft_format::base64_decode).ok_or("the print job has no data")?;
+    let title = app.session.active().map(|d| d.title()).unwrap_or_default();
+    Ok((v, pdf, title))
+}
+
+/// `file.printSystem`: lay the active document's job out as `file.print` does (`preset`, `settings`:
+/// marks, bleed, color management…) and show the system's print panel for it, where the printer
+/// driver's own options are. The job has one copy, because the panel decides the copies.
+pub fn run_system(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
+    if !app.services.print.as_ref().is_some_and(|s| s.has_system_panel()) {
+        return Err("the system print panel isn't available here".into());
+    }
+    let mut q = json!({});
+    for k in ["preset", "settings"] {
+        if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
+            q[k] = v.clone();
+        }
+    }
+    match q.get_mut("settings") {
+        Some(Value::Object(settings)) => {
+            settings.insert("copies".into(), json!(1));
+        }
+        Some(_) => return Err("settings must be an object".into()),
+        None => q["settings"] = json!({ "copies": 1 }),
+    }
+    let (mut v, pdf, title) = layout(app, &q)?;
+    let service = app.services.print.as_mut().ok_or("no print service")?;
+    let done = service.print_with_panel(&PrintJob { printer: None, title: &title, pdf: &pdf })?;
+    app.status(done);
+    // The panel is a sheet: whether the person prints is not known yet.
+    v["printed"] = json!(false);
+    v["panel"] = json!(true);
     Ok(v)
 }

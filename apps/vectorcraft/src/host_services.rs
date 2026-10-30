@@ -256,7 +256,7 @@ pub(crate) fn services(parent: Parent, ui: egui::Context) -> Services {
         .and_then(|w| w.window_handle().ok())
         .is_some_and(|h| matches!(h.as_raw(), RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_)));
     let (clip, clip_probe) = (parent.clone(), parent.clone());
-    let (p1, p2, p3, p4, p5) = (parent.clone(), parent.clone(), parent.clone(), parent.clone(), parent);
+    let (p1, p2, p3, p4, p5, p6) = (parent.clone(), parent.clone(), parent.clone(), parent.clone(), parent.clone(), parent);
     #[cfg(target_os = "macos")]
     let sampled_ui = ui.clone();
     Services {
@@ -305,7 +305,7 @@ pub(crate) fn services(parent: Parent, ui: egui::Context) -> Services {
         #[cfg(target_os = "macos")]
         screen_color: Some(mac_screen_color::sampler(sampled_ui)),
         // File → Print: the system's printers and print queue.
-        print: Some(Box::new(printing::SystemPrint)),
+        print: Some(Box::new(printing::SystemPrint::new(p6))),
         ..Default::default()
     }
 }

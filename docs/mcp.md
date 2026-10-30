@@ -4299,7 +4299,9 @@ document onto the page (pt, y down), the document `area` it prints and its `trim
 `inks` of a separation and `warnings`. `file.print {settings?, path?}` writes the job as a print-ready PDF (one page per
 sheet, tile, ink and copy); headless it answers `dataBase64`. In the app, `file.print` with no params opens the Print
 dialog, and with params it prints through the system (`printer`: a name from `print.printers`, default the system's
-default printer) or, with `toFile`, a `path` or no printing available, saves the PDF.
+default printer) or, with `toFile`, a `path` or no printing available, saves the PDF. `file.printSystem {preset?,
+settings?}` lays the same job out with one copy and shows the system's own print panel for it (macOS, as a sheet; it is
+disabled and answers with an error elsewhere): `{pages, panel: true, printed: false, warnings}`.
 
 ```json
 {"name":"run_command","arguments":{"command":"print.setup","params":{"settings":{"media":"a4","scaling":"fit","marks":{"trim":true}}}}}

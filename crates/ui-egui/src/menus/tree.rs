@@ -74,6 +74,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 c("File Info…", "file.info"),
                 Sep,
                 c("Print…", "file.print"),
+                c("Print with System Dialog…", "file.printSystem"),
                 Sep,
                 c("Exit", "app.quit"),
             ],

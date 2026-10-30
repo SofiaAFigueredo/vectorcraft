@@ -266,3 +266,66 @@ fn the_control_channel_fills_and_confirms_the_dialog() {
     assert_eq!(app.session.active().unwrap().doc.print_setup.as_ref().unwrap()["copies"], 5);
     assert_eq!(jobs.borrow().len(), 1);
 }
+
+/// A print service with the system's own print panel (macOS): what it was shown goes to `Jobs`.
+struct PanelPrint(Jobs);
+
+impl PrintService for PanelPrint {
+    fn printers(&mut self) -> Vec<Printer> {
+        vec![]
+    }
+
+    fn print(&mut self, _job: &PrintJob) -> Result<String, String> {
+        Err("Print with System Dialog… doesn't use the queue directly".into())
+    }
+
+    fn has_system_panel(&self) -> bool {
+        true
+    }
+
+    fn print_with_panel(&mut self, job: &PrintJob) -> Result<String, String> {
+        self.0.borrow_mut().push((job.printer.map(str::to_string), job.title.to_string(), job.pdf.to_vec()));
+        Ok("Showing the panel".into())
+    }
+}
+
+#[test]
+fn print_with_system_dialog_lays_the_job_out_as_one_copy_and_shows_the_panel() {
+    let jobs = Jobs::default();
+    let services = Services { print: Some(Box::new(PanelPrint(jobs.clone()))), ..Default::default() };
+    let mut app = VectorcraftApp::new(Session::new(), services);
+    app.run("file.new", json!({"width": 120, "height": 90, "artboards": 3})).unwrap();
+    app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 50, "height": 40})).unwrap();
+    assert!(crate::menus::enabled(&app, "file.printSystem"));
+    // Artboards 2-3, three copies asked for: the panel decides the copies, so the job has one.
+    let r = app.run("file.printSystem", json!({"settings": {"copies": 3, "artboards": "range", "range": "2-3", "marks": {"trim": true}}})).unwrap();
+    assert_eq!((r["panel"].clone(), r["printed"].clone(), r["pages"].clone()), (json!(true), json!(false), json!(2)));
+    assert_eq!(app.ui.status, "Showing the panel");
+    let jobs = jobs.borrow();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].0, None, "the panel picks the printer");
+    assert_eq!(pages(&jobs[0].2), 2);
+    // The marks are in the pages: they are larger than the 120 × 90 artboards.
+    let size = vectorcraft_pdf::info(&jobs[0].2, None).unwrap().pages[0].width;
+    assert!(size > 120.0, "{size}");
+    // The document's own settings are left as they were.
+    assert!(app.session.active().unwrap().doc.print_setup.is_none());
+}
+
+#[test]
+fn print_with_system_dialog_is_off_where_there_is_no_system_panel() {
+    // A queue without the panel (Windows, Linux, the web), and no print service at all.
+    let (mut app, jobs) = app();
+    assert!(!crate::menus::enabled(&app, "file.printSystem"));
+    assert!(app.run("file.printSystem", json!({})).is_err());
+    let mut bare = VectorcraftApp::new(Session::new(), Services::default());
+    bare.run("file.new", json!({"width": 120, "height": 90})).unwrap();
+    assert!(!crate::menus::enabled(&bare, "file.printSystem"));
+    assert!(bare.run("file.printSystem", json!({})).is_err());
+    assert!(jobs.borrow().is_empty(), "nothing was sent to the queue");
+    // Settings that aren't an object are refused before anything is laid out.
+    let services = Services { print: Some(Box::new(PanelPrint(Jobs::default()))), ..Default::default() };
+    let mut panel = VectorcraftApp::new(Session::new(), services);
+    panel.run("file.new", json!({"width": 120, "height": 90})).unwrap();
+    assert!(panel.run("file.printSystem", json!({"settings": "fit"})).is_err());
+}
