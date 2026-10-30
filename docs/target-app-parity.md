@@ -1,6 +1,6 @@
 # Parity with Adobe Illustrator
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-30 · **Change:** minor (Libraries panel: art dragged off the canvas and swatches dragged in are added where they are dropped; scores unchanged; previously: Guides: a moved selection's edges and centre land on ruler guides, not only the point it was grabbed by (#4312); scores and estimates unchanged) · **Target:** Adobe Illustrator 2026 (30.x; public release notes through 30.7, August 2026)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-30 · **Change:** minor (3D Extrude & Bevel, Inflate and Rotate apply to type, which stays editable (#4715); scores unchanged) · **Target:** Adobe Illustrator 2026 (30.x; public release notes through 30.7, August 2026)
 
 ## Feature submission evidence
 
@@ -788,6 +788,7 @@ Moved from the ROADMAP's "Shipped so far" on 2026-10-10. Update it when a featur
   - Divide uses open lines, bent paths and curves as cutting edges (#1307), preserving the frontmost filled face's appearance and holes. Engine tests cover implicit closure of filled open contours and unrelated objects; native automation confirms independent piece movement, one Undo/Redo, canvas/window captures and an exact saved-document read by a separate CLI process. The shared planar map keeps a segment cap (65,536 since #937, was 4,096) and its filled-area fallback; other Pathfinder operations are unchanged.
   - Type that Transform effects only move and copy (no scale, rotation, reflection or Random) exports as type in each place, and PDF export writes every copy as selectable, searchable text, when its characters are in solid colors without underline or strikethrough, the type object has no fills or strokes of its own, no inline graphics and no perspective, its transform does not scale or shear stroked characters, and the copies do not overlap. When the effect is on the type itself, the type can also have transparency, an opacity mask and raster effects. When the effect is on the group or layer holding the type, the type has no transparency or effects of its own and is not in a clipping path, the group or layer has no fill, stroke or Pathfinder effect of its own, and no group between them has a fill, stroke, Pathfinder or geometry effect. Type still exports as outlines when the effect stops its copies early, or when the copies would number more than 10,000 or take more than 20,000,000 bytes of document data, and so does other type under a geometry effect.
   - Extrude & Bevel and Inflate treat strokes as outlined: each visible stroke builds a solid from its outline in its own paint beside the top fill's ([three-d.md](three-d.md#fills-and-strokes)).
+  - Extrude & Bevel, Inflate and Rotate apply to type: it makes a solid of its glyph outlines, painted with its own fills and strokes or, when it has none, its characters' colour (the first run's), and stays type, so editing the text reshapes the solid (#4715).
   - Extrude & Bevel, Inflate and Rotate (Effect › 3D and Materials): live effects in the `three-d` crate with depth, twist, taper, solid or hollow caps, five original bevel shapes (width, height, repeat, spacing, inside, both sides), Inflate's volume, both sides, twist, taper and cap, Rotate's turned fills and strokes, Position presets, the rotation and light gizmos, SVG/PDF vector output and Expand Appearance; one 3D effect per object; covered by geometry, effect, canvas-versus-export, command and dialog tests ([three-d.md](three-d.md)).
   - Initial live Revolve (#605, #846): a portable geometry and shading crate (`three-d`), editable path and compound profiles, compact options with artboard rotation and light gizmos, SVG/PDF vector output and Expand Appearance that can trim covered faces. Open ends have continuous caps by default, shading is smooth with one to ten colored lights, and intersecting surfaces' visibility is approximate ([revolve.md](revolve.md)).
   - Live effects with previewing dialogs: Distort & Transform, Path, Convert to Shape, 15 Warp styles, Round Corners, Scribble, Effect → Pathfinder (all 10 operations, live on groups; several loose objects are grouped first, in one undo step), Color Adjustments (Brightness/Contrast, Curves, Levels, Hue/Saturation, Shift to Color, Temperature/Tint, on vectors, live type and embedded images), and raster drop shadow, glows and feather. SVG and PDF export keep live effects (geometry baked; SVG raster effects as filters). Zig Zag spaces its ridges evenly along each segment, so lines and curves get a regular wave in Corner and Smooth (#1558). Warp › Arc (the effect and Envelope › Make with Warp) bends in the object's real proportions: a circular arc with concentric edges and no fold-over at 100%, so Arc on art that isn't square draws differently from before (#1581, fixes #1578). `effect.apply` and `effect.setParams` give an error for a misspelt or wrongly typed effect parameter instead of running the effect with its default (#1623, #1592). Roughen with Smooth keeps turn-backs smooth instead of making cusps that draw as spikes (#1646, #1643). Scribble draws one zig-zag per region, with no lines across holes and notches; convex shapes are unchanged (#1651, #1648). On the canvas, in Expand Appearance and in exports, Effect → Pathfinder uses the glyph outlines of type in the group, and results painted like the type keep its opacity and blend mode.
@@ -948,6 +949,7 @@ Moved from the ROADMAP's "Shipped so far" on 2026-10-10. Update it when a featur
     Type inside a group, layer, symbol instance, blend or repeat keeps its opacity, blend mode, opacity mask, Opacity & Mask Define Knockout Shape, own effects, perspective and visibility when the effects on the container outline it. Hidden type with a geometry effect of its own is left out of exports.
   - **Graphic styles:** styles keep opacity and blend mode, capture groups and type, apply on top with Alt, and link to the objects using them; Redefine, Break Link, Graphic Style Options, Select All Unused, Sort by Name, and Select > Same Graphic Style / Appearance Attribute. The panel has list and thumbnail views with rendered previews, merge, reorder and drag and drop, plus a Control bar Style picker; six generated style libraries save and load as `.vcstyles`.
     In the Graphic Styles panel, Shift-click selects a range of styles and Ctrl/Cmd-click adds or removes one.
+  - **Several text styles at once:** in the Character Styles and Paragraph Styles panels, Shift-click highlights a range of styles and Ctrl/Cmd-click adds or removes one, without applying them; the panel menu's Select All Unused (`charStyle.unused`, `paraStyle.unused`) highlights the styles no type uses (in the layers, opacity masks, symbols, graph designs, pattern tiles and the art of brushes), never the Normal style; Delete, the button or the menu item, deletes every highlighted style but Normal in one undo step (`charStyle.delete {names}`, `paraStyle.delete {names}`). The menu's Duplicate copies every highlighted style in one undo step and highlights the copies. A highlighted row dragged onto Create New Style or Delete carries every highlighted style: dropped on Create New Style it copies them all and highlights the copies, and dropped on Delete it deletes them all but Normal and clears the highlight; a row from outside the highlight carries only its own style. Public reference: [Character and paragraph styles](https://web.archive.org/web/20261015081534/https://helpx.adobe.com/illustrator/using/character-paragraph-styles.html).
   - **Neutral wording:** labels, MCP tool text, docs and packaging use neutral names, and `cargo xtask brands` (part of `cargo xtask ci`) fails on vendor names.
 - **Colour, type and file workflows:** Recolor Artwork (dialog with harmonies), Edit Colors, Find & Replace, Change Case, Smart Punctuation, Guides, Lock/Hide Above, Transform Each, Rasterize.
   The Libraries panel holds gradients and patterns: its + button adds the selection's fill or stroke gradient or pattern, a gradient or pattern swatch dragged from the Swatches panel is added, and a click paints the selection through the active Fill/Stroke proxy, a pattern bringing its definition and swatch into the document.
@@ -1229,6 +1231,19 @@ Kernels in `vectorcraft_pathops::addons::pathtools`. Tests: `addons::pathtools` 
 undo step, bad params refused, the brush's stroke one step) and `edit_toolbar::tests::addon_tools_are_in_the_drawer_not_the_toolbars`.
 Commands: `docs/mcp.md` › Path Precision Tools add-on.
 
+The add-on's Parametric Shape Tool (2026-10-30) draws ten kinds of shape that stay editable as numbers (rectangle,
+ellipse, polygon and star with 3 to 1,000 sides or points, ring, arrow, cross, heart, gear, speech bubble; corner radius
+limited to the middle of a side): a drag from the centre sizes and turns one, the arrow keys change its count and values
+while dragging, handles edit a selected one, a double-click places one with the last settings, and its panel edits the
+numbers. A shape is a plain path whose numbers and outline fingerprint sit in one object-data entry that SVG export
+leaves out; moving, rotating or scaling it keeps it editable, editing its anchors makes it a plain path. Convert to
+Parametric Shape recognises plain rectangles, ellipses and regular polygons. Geometry in
+`vectorcraft_pathops::addons::pathtools::shapes`. Tests: `shapes` in `vectorcraft-pathops` (each kind, ranges,
+recovery after transforms, recognition), `addons::parametric_shape` in `vectorcraft-tools` (drag, keys, handles,
+stored data), `cmd::addons::pathtools::tests` in `vectorcraft-engine` (each command one undo step, bad params refused,
+anchor edits and transforms, the SVG export filter, the tool's gestures), `addons::pathtools::tests` in
+`vectorcraft-ui-egui` (submenu and panel) and `command_sweep`.
+
 ## Smart Pen add-on (2026-10-30)
 
 A VectorCraft addition, not an Illustrator feature, so no area score moves. Object › Plug-ins › Smart Pen selects the
@@ -1255,11 +1270,23 @@ identity), `cmd::addons::color::tests` in `vectorcraft-engine` (drawn live witho
 undo step, with any adjustment and its params; bad requests refused) and `addons::color::tests` in
 `vectorcraft-ui-egui` (the menus and the panel). Select by Color Kind (`addon.color.select`) selects the objects that use
 spot colours, carry a colour adjustment, or are RGB, CMYK or grayscale images
-(`select_by_color_kind_finds_spot_colours_effects_and_image_models`). Commands: `docs/mcp.md` › Color Effects add-on.
+(`select_by_color_kind_finds_spot_colours_effects_and_image_models`). Vector Halftone (`addon.color.halftone`) draws the
+object as the dots Object › Vector Halftone makes, live: the screens and dots are shared
+(`vectorcraft_effects::addons::halftone`), the renderer samples the art and keeps the dots while it doesn't change
+(`vectorcraft_render::addons::halftone`), and Expand Appearance and the SVG, PDF, EPS and AI exporters write the paths.
+Tests: `addons::halftone` in `vectorcraft-effects` (settings, tone, caps), `addons::halftone::tests` in
+`vectorcraft-render` (drawn as dots, settings change them, unchanged art not sampled again, too many cells draw the
+object as it is), `expand_appearance_gives_the_dots_object_vector_halftone_makes`,
+`exports_write_the_dots_as_paths` and `a_halftone_past_the_caps_leaves_the_object_as_it_is` in `vectorcraft-engine`,
+and `the_halftone_effect_dialog_has_the_command_fields_and_edits_the_effect` in `vectorcraft-ui-egui`. Commands:
+`docs/mcp.md` › Color Effects add-on.
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | 3D Extrude & Bevel, Inflate and Rotate apply to type, which stays editable (#4715); scores and estimates unchanged |
+| 2026-10-30 | minor | Color Effects add-on: live Vector Halftone; scores and estimates unchanged |
+| 2026-10-30 | minor | Path Precision Tools add-on: the Parametric Shape Tool; evidence added; scores unchanged. |
 | 2026-10-30 | minor | Presentation Mode fits the active artboard and hides selections, guides, grids and artboard edges; scores and estimates unchanged |
 | 2026-10-30 | minor | Color Effects add-on: Select by Color Kind; scores and estimates unchanged |
 | 2026-10-30 | minor | Gradient stop popover: an eyedropper samples the stop's colour from the art (#4681); scores and estimates unchanged |
