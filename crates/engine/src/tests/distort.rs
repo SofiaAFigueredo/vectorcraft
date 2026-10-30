@@ -892,3 +892,54 @@ fn perspective_moves_refuse_a_boolean_given_as_text() {
         assert_eq!(history(&s).0, before.1.0 + i + 1, "{c} {p}");
     }
 }
+
+/// Anchors of every path under the document's root layer(s).
+fn total_anchors(s: &Session) -> (usize, usize) {
+    let (mut n, mut paths) = (0, 0);
+    s.doc().unwrap().doc.walk(|node| {
+        if let vectorcraft_doc::NodeKind::Path { path, .. } = &node.kind {
+            n += path.anchor_count();
+            paths += 1;
+        }
+    });
+    (paths, n)
+}
+
+#[test]
+fn expanding_a_width_stroke_on_a_tight_curve_keeps_few_anchors() {
+    let mut s = session();
+    // A tall thin ellipse: the stroke turns through 180° with a small radius at each end.
+    let r = s.execute("shape.ellipse", &json!({"x": 100, "y": 100, "width": 16, "height": 200})).unwrap();
+    let id = NodeId(r["id"].as_u64().unwrap());
+    s.execute("fill.set", &json!({"ids": [id.0], "paint": "none"})).ok();
+    s.execute("stroke.set", &json!({"ids": [id.0], "weight": 10})).unwrap();
+    s.execute("stroke.widthPoint.set", &json!({"id": id.0, "t": 0.25, "left": 14, "right": 14})).unwrap();
+    s.execute("stroke.widthPoint.set", &json!({"id": id.0, "t": 0.75, "left": 4, "right": 4})).unwrap();
+    // What the stroke paints, before it is expanded.
+    let reference = {
+        let doc = s.doc().unwrap();
+        let node = doc.doc.node(id).unwrap();
+        let st = node
+            .appearance
+            .items
+            .iter()
+            .find_map(|i| if let vectorcraft_doc::AppearanceItem::Stroke(st) = i { Some(st.clone()) } else { None })
+            .unwrap();
+        let (path, rule) = (node.path_data().unwrap().clone(), vectorcraft_geom::FillRule::NonZero);
+        vectorcraft_render::effects::stroke::outline_region(&path, rule, &st).to_bezpath().area().abs()
+    };
+    s.execute("select.all", &json!({})).unwrap();
+    s.execute("object.expand", &json!({"object": true, "fill": false, "stroke": true})).unwrap();
+    let (paths, anchors) = total_anchors(&s);
+    assert!(paths >= 1 && anchors <= 60, "{paths} paths, {anchors} anchors");
+    // The refit stays on the stroke: the ring it leaves (an outer outline minus the hole inside it)
+    // has the painted area, to within 1%.
+    let mut areas = vec![];
+    s.doc().unwrap().doc.walk(|node| {
+        if let vectorcraft_doc::NodeKind::Path { path, .. } = &node.kind {
+            areas.push(path.to_bezpath().area().abs());
+        }
+    });
+    let ring = areas.iter().any(|a| areas.iter().any(|hole| a > hole && (a - hole - reference).abs() / reference < 0.01));
+    assert!(ring, "{areas:?} vs {reference}");
+}

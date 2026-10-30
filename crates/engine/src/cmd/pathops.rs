@@ -758,6 +758,19 @@ fn offset_path(s: &mut Session, p: &Value) -> Result<Value> {
 // ---------- Outline Stroke ----------
 
 /// Can Outline Stroke turn `st` into filled art?
+/// How far (pt) the refit of a width-profile outline may stray from the traced one.
+const WIDTH_REFIT_TOL: f64 = 0.05;
+
+/// The outline of a stroke with a width profile, refitted. The outliner traces the two sides of
+/// the stroke point by point (and rounds every tight bend into many tiny segments), which would
+/// leave a node at each; the refit gives the curve a few anchors, keeping the real corners (the
+/// stroke's tips and caps).
+fn refit_width_outline(outline: PathData) -> PathData {
+    let opts = vectorcraft_pathops::SimplifyOptions { tolerance: WIDTH_REFIT_TOL, corner_angle_deg: 45.0, straight_lines: false };
+    let fitted = vectorcraft_pathops::simplify_with(&outline, &opts);
+    if fitted.is_empty() { outline } else { fitted }
+}
+
 fn outlinable(st: &StrokeLayer) -> bool {
     st.visible && !st.paint.is_none() && st.width > 0.0
 }
@@ -805,9 +818,12 @@ pub(crate) fn outlined_stroke(
         }
         return Some(art);
     }
-    let outline = vectorcraft_render::effects::stroke::outline_region(path, rule, st);
+    let mut outline = vectorcraft_render::effects::stroke::outline_region(path, rule, st);
     if outline.is_empty() {
         return None;
+    }
+    if st.profile.is_some() {
+        outline = refit_width_outline(outline);
     }
     if let Some(g) = st.path_gradient() {
         // A gradient along or across the stroke: gradient meshes clipped to its outline.
