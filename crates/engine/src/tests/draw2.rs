@@ -3968,3 +3968,44 @@ fn shape_counts_that_are_not_whole_numbers_are_errors() {
         assert!(s.execute("shape.spiral", &json!({"cx": 1, "cy": 1, "radius": 5, "segments": bad})).is_err(), "{bad}");
     }
 }
+
+/// A shaky drag down the middle of a 200 × 100 rectangle: a wave with ±0.9 pt of hand jitter.
+fn shaky_cut() -> Vec<[f64; 2]> {
+    (0..=120).map(|i| [200.0 + if i % 2 == 0 { 0.9 } else { -0.9 } + (i as f64 * 0.1).sin() * 6.0, 50.0 + i as f64 * 2.0]).collect()
+}
+
+#[test]
+fn knife_with_fidelity_fits_a_shaky_drag_into_few_anchors() {
+    let mut s = session();
+    rect(&mut s, 100.0, 100.0, 200.0, 100.0);
+    s.execute("select.none", &json!({})).unwrap();
+    s.execute("path.knife", &json!({"points": shaky_cut(), "fidelity": 1.5})).unwrap();
+    let ps = paths(&s);
+    assert_eq!(ps.len(), 2);
+    for (_, p) in &ps {
+        assert!(p.anchor_count() <= 16, "{} anchors", p.anchor_count());
+    }
+    let total: f64 = ps.iter().map(|(_, p)| area(p)).sum();
+    assert!((total - 20000.0).abs() < 50.0, "{total}");
+}
+
+#[test]
+fn knife_without_fidelity_follows_the_polyline() {
+    let mut s = session();
+    rect(&mut s, 100.0, 100.0, 200.0, 100.0);
+    s.execute("select.none", &json!({})).unwrap();
+    s.execute("path.knife", &json!({"points": shaky_cut()})).unwrap();
+    assert!(paths(&s).iter().all(|(_, p)| p.anchor_count() > 50));
+}
+
+#[test]
+fn knife_tool_drag_does_not_keep_the_jitter_of_the_hand() {
+    let mut s = session();
+    rect(&mut s, 100.0, 100.0, 200.0, 100.0);
+    s.execute("select.none", &json!({})).unwrap();
+    let pts: Vec<(f64, f64)> = shaky_cut().iter().map(|p| (p[0], p[1])).collect();
+    drag(&mut s, "knife", &pts, Mods::default());
+    let ps = paths(&s);
+    assert_eq!(ps.len(), 2);
+    assert!(ps.iter().all(|(_, p)| p.anchor_count() <= 16), "{:?}", ps.iter().map(|(_, p)| p.anchor_count()).collect::<Vec<_>>());
+}
