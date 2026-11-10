@@ -721,6 +721,41 @@ fn a_shift_move_lands_the_edges_on_a_ruler_guide() {
     assert!(moved_by(m, (133.0, 0.0)), "{m:?}");
 }
 
+/// #4312, #1534: a ruler guide within reach of the point a selection is grabbed by wins over lining
+/// an edge up with another, which would pull the point out of that reach; the edge lines up with its
+/// guide when no guide is within reach of the point. Also under Shift.
+#[test]
+fn a_move_keeps_the_grabbed_point_on_its_ruler_guide_over_an_edge_guide() {
+    let (mut d, id) = doc_with_rect();
+    // The rectangle spans 100..200; grabbed at 120, its left edge is 20 before the point. A guide
+    // at 333 is within reach of the point (2, or 4 along a Shift line) and one at 308.5 of the left
+    // edge (4), 24.5 before it.
+    d.guides = vec![vectorcraft_doc::Guide::new(true, 333.0), vectorcraft_doc::Guide::new(true, 308.5)];
+    let mut s = Selection::default();
+    s.add(id);
+    let p = paint();
+    let c = cx(&d, &s, &p);
+    assert!(c.smart_guides && c.snap_to_point);
+    let dx = |shift: bool, to: f64| {
+        let m = Mods { shift, ..Mods::default() };
+        let mut t = SelectionTool::default();
+        t.pointer(&c, &ev(PointerKind::Down, 120.0, 120.0).with_mods(m));
+        let a = t.pointer(&c, &ev(PointerKind::Drag, to, 120.0).with_mods(m));
+        let Some(Action::Preview(_, v)) = a.last() else { panic!("{a:?}") };
+        v["matrix"][4].as_f64().unwrap()
+    };
+    for shift in [false, true] {
+        // The point ends 1 short of its guide, the left edge 3.5 past its own, which would take the
+        // point 4.5 from its guide: the point lands on its guide (120 + 213 = 333).
+        let got = dx(shift, 332.0);
+        assert!((got - 213.0).abs() < 1e-9, "shift {shift}: the grabbed point lands on its guide: {got}");
+        // The point ends 7 from its guide, out of reach, and stays out of it when the left edge lands
+        // on its own guide (100 + 208.5 = 308.5).
+        let got = dx(shift, 326.0);
+        assert!((got - 208.5).abs() < 1e-9, "shift {shift}: no guide near the point, the edge lands on its guide: {got}");
+    }
+}
+
 /// #4312: a ruler guide that is hidden (View → Guides off, or its layer hidden) pulls the edges and
 /// centre of a moved selection no more than it pulls a point; shown, it does.
 #[test]
