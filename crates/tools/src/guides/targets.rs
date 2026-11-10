@@ -740,6 +740,15 @@ impl Targets {
         self.nearest_point(p, tol).is_some()
     }
 
+    /// Is a ruler guide running past `p` within `tol` of it across its line? The grabbed point of
+    /// a move then lands on the guide, ahead of the bounds lining up (#1534).
+    pub(crate) fn has_ruler_near(&self, p: Point, tol: f64) -> bool {
+        self.rulers.iter().any(|r| {
+            let across = if r.vertical { p.x } else { p.y };
+            (r.pos - across).abs() <= tol && r.line_at(p, tol).is_some()
+        })
+    }
+
     pub(super) fn nearest_point(&self, p: Point, tol: f64) -> Option<(Point, Kind)> {
         within(&self.points, |q| q.0.x, p.x, tol)
             .iter()

@@ -721,6 +721,35 @@ fn a_shift_move_lands_the_edges_on_a_ruler_guide() {
     assert!(moved_by(m, (133.0, 0.0)), "{m:?}");
 }
 
+/// A ruler guide within reach of the grabbed point wins over the bounds lining up with another
+/// guide or line, even where that would move the grabbed point out of the guide's reach (#1534, #4312).
+#[test]
+fn a_ruler_guide_at_the_grabbed_point_wins_over_the_bounds_lining_up() {
+    let (mut d, id) = doc_with_rect();
+    // The rectangle spans 100..200; grabbed at 120, it is dragged so that the point is 1.4 short of
+    // the guide at 173.4. The artboard's line at 250 is in reach of the right edge (152 + 100 = 252,
+    // 2 off) and would pull the move 2 back, taking the grabbed point 3.4 from the guide.
+    d.guides = vec![vectorcraft_doc::Guide::new(true, 173.4)];
+    let mut s = Selection::default();
+    s.add(id);
+    let p = paint();
+    let c = cx(&d, &s, &p);
+    let mut t = SelectionTool::default();
+    t.pointer(&c, &ev(PointerKind::Down, 120.0, 120.0));
+    let a = t.pointer(&c, &ev(PointerKind::Drag, 172.0, 120.0));
+    let Some(Action::Preview(_, v)) = a.last() else { panic!("{a:?}") };
+    let dx = v["matrix"][4].as_f64().unwrap();
+    assert!((dx - 53.4).abs() < 1e-9, "the grabbed point lands on the guide: {dx}");
+    // Shift: the same, along the line.
+    let shift = |kind, x, y| ev(kind, x, y).with_mods(Mods { shift: true, ..Mods::default() });
+    let mut t = SelectionTool::default();
+    t.pointer(&c, &shift(PointerKind::Down, 120.0, 120.0));
+    let a = t.pointer(&c, &shift(PointerKind::Drag, 172.0, 120.0));
+    let Some(Action::Preview(_, v)) = a.get(1) else { panic!("{a:?}") };
+    let dx = v["matrix"][4].as_f64().unwrap();
+    assert!((dx - 53.4).abs() < 1e-9, "a Shift move: {dx}");
+}
+
 /// #4312: a ruler guide that is hidden (View → Guides off, or its layer hidden) pulls the edges and
 /// centre of a moved selection no more than it pulls a point; shown, it does.
 #[test]

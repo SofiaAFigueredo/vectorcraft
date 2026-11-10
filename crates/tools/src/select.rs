@@ -221,7 +221,14 @@ impl MoveSnap {
             d = q - start;
             guides = ov;
         }
-        if let (Some(t), Some(b)) = (targets, self.bounds) {
+        // A ruler guide within reach of the grabbed point wins over lining the bounds up: checked
+        // before the bounds move the grabbed point out of its reach.
+        let ruler = self.rulers.as_ref().is_some_and(|t| t.has_ruler_near(start + d, cx.tol(cx.snap_tolerance)));
+        if let Some(t) = self.rulers.as_ref().filter(|_| ruler) {
+            let (q, ov) = t.snap_point(start + d, cx.tol(cx.snap_tolerance));
+            d = q - start;
+            guides = ov;
+        } else if let (Some(t), Some(b)) = (targets, self.bounds) {
             // The point the selection was grabbed by, near another object's anchor or centre,
             // lands on it, rather than the bounds lining up a little beside it (#955).
             if t.has_point_near(start + d, cx.snap_tol()) {
@@ -231,14 +238,6 @@ impl MoveSnap {
             } else {
                 let (adj, ov) = t.snap_rect(b + d, cx.snap_tol());
                 d += adj;
-                guides = ov;
-            }
-        }
-        // A ruler guide within reach of the grabbed point wins over lining the bounds up.
-        if let Some(t) = &self.rulers {
-            let (q, ov) = t.snap_point(start + d, cx.tol(cx.snap_tolerance));
-            if q != start + d {
-                d = q - start;
                 guides = ov;
             }
         }
@@ -286,7 +285,19 @@ impl MoveSnap {
             d = q - start;
             guides = ov;
         }
-        if let (Some(t), Some(b)) = (targets, self.bounds) {
+        // As in [`Self::snap`], a ruler guide within reach of the grabbed point comes first.
+        let before = start + d;
+        let reach = cx.tol(cx.snap_tolerance);
+        let mut on_ruler = false;
+        if let Some(t) = &self.rulers {
+            let (q, ov) = t.snap_point_along(before, u, reach);
+            if q != before {
+                d = q - start;
+                guides = ov;
+                on_ruler = true;
+            }
+        }
+        if !on_ruler && let (Some(t), Some(b)) = (targets, self.bounds) {
             if t.has_point_near(start + d, cx.snap_tol()) {
                 let (q, ov) = t.snap_point_along(start + d, u, cx.snap_tol());
                 d = q - start;
@@ -294,13 +305,6 @@ impl MoveSnap {
             } else {
                 let (adj, ov) = t.snap_rects_along(&[b + d], u, cx.snap_tol());
                 d += adj;
-                guides = ov;
-            }
-        }
-        if let Some(t) = &self.rulers {
-            let (q, ov) = t.snap_point_along(start + d, u, cx.tol(cx.snap_tolerance));
-            if q != start + d {
-                d = q - start;
                 guides = ov;
             }
         }
