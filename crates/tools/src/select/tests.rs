@@ -669,6 +669,87 @@ fn a_move_snaps_the_grabbed_point_to_a_ruler_guide_with_smart_guides_on() {
     assert_eq!(dx(&ToolContext { snap_to_point: false, ..cx(&d, &s, &p) }, 172.0), 22.0);
 }
 
+/// #4312: with Smart Guides and Snap to Point on, a moved selection's edges and centre land on a
+/// ruler guide as they land on other art, wherever the pointer is; Snap to Point off, or out of
+/// reach, they don't.
+#[test]
+fn a_move_lands_the_edges_and_centre_on_a_ruler_guide() {
+    let (mut d, id) = doc_with_rect();
+    // The rectangle spans 100..200 on both axes; the artboard's lines (0, 250, 500) are out of reach.
+    let mut s = Selection::default();
+    s.add(id);
+    let p = paint();
+    // Grabbed at (120, 120), far from the guide, and dragged to put `to` of its bounds `short` before it.
+    let moved = |c: &ToolContext, vertical: bool, edge: f64, short: f64| {
+        let guide = 333.0;
+        let by = guide - short - edge;
+        let mut t = SelectionTool::default();
+        t.pointer(c, &ev(PointerKind::Down, 120.0, 120.0));
+        let (x, y) = if vertical { (120.0 + by, 120.0) } else { (120.0, 120.0 + by) };
+        let a = t.pointer(c, &ev(PointerKind::Drag, x, y));
+        let Some(Action::Preview(_, v)) = a.last() else { panic!("{a:?}") };
+        v["matrix"][if vertical { 4 } else { 5 }].as_f64().unwrap() - by
+    };
+    for vertical in [true, false] {
+        d.guides = vec![vectorcraft_doc::Guide::new(vertical, 333.0)];
+        let c = cx(&d, &s, &p);
+        assert!(c.smart_guides && c.snap_to_point);
+        for (what, edge) in [("start edge", 100.0), ("centre", 150.0), ("end edge", 200.0)] {
+            let got = moved(&c, vertical, edge, 2.0);
+            assert!((got - 2.0).abs() < 1e-9, "{what} (vertical guide: {vertical}) is pulled onto the guide: {got}");
+            assert!(moved(&c, vertical, edge, 12.0).abs() < 1e-9, "{what} out of reach");
+        }
+        let off = ToolContext { snap_to_point: false, ..cx(&d, &s, &p) };
+        assert!(moved(&off, vertical, 100.0, 2.0).abs() < 1e-9, "Snap to Point off");
+    }
+}
+
+/// #4312: a Shift move keeps to its line while its edges and centre land on a ruler guide.
+#[test]
+fn a_shift_move_lands_the_edges_on_a_ruler_guide() {
+    let (mut d, id) = doc_with_rect();
+    d.guides = vec![vectorcraft_doc::Guide::new(true, 333.0)];
+    let mut s = Selection::default();
+    s.add(id);
+    let p = paint();
+    let c = cx(&d, &s, &p);
+    // Level; the left edge (100) would end 2 short of the guide, the pointer far from it.
+    let (m, _) = shift_moved(&c, (150.0 + 231.0, 150.0));
+    assert!(moved_by(m, (233.0, 0.0)), "{m:?}");
+    // The right edge, from the other side.
+    let (m, _) = shift_moved(&c, (150.0 + 136.0, 150.0));
+    assert!(moved_by(m, (133.0, 0.0)), "{m:?}");
+}
+
+/// #4312: a ruler guide that is hidden (View → Guides off, or its layer hidden) pulls the edges and
+/// centre of a moved selection no more than it pulls a point; shown, it does.
+#[test]
+fn a_hidden_ruler_guide_pulls_no_edge_of_a_move() {
+    let (mut d, id) = doc_with_rect();
+    // The guide is on a layer of its own, so hiding that layer doesn't hide the rectangle too.
+    let layer = d.add_layer(Some("Guides"));
+    let mut guide = vectorcraft_doc::Guide::new(true, 333.0);
+    guide.layer = Some(layer);
+    d.guides = vec![guide];
+    let mut s = Selection::default();
+    s.add(id);
+    let p = paint();
+    // Grabbed far from the guide; the left edge (100) ends 2 short of it.
+    let by = 333.0 - 2.0 - 100.0;
+    let dx = |c: &ToolContext| {
+        let mut t = SelectionTool::default();
+        t.pointer(c, &ev(PointerKind::Down, 120.0, 120.0));
+        let a = t.pointer(c, &ev(PointerKind::Drag, 120.0 + by, 120.0));
+        let Some(Action::Preview(_, v)) = a.last() else { panic!("{a:?}") };
+        v["matrix"][4].as_f64().unwrap()
+    };
+    assert!((dx(&cx(&d, &s, &p)) - (by + 2.0)).abs() < 1e-9, "shown: pulled onto the guide");
+    let off = ToolContext { guides: false, ..cx(&d, &s, &p) };
+    assert!((dx(&off) - by).abs() < 1e-9, "View → Guides off: nothing pulls");
+    d.node_mut(layer).unwrap().visible = false;
+    assert!((dx(&cx(&d, &s, &p)) - by).abs() < 1e-9, "its layer hidden: nothing pulls");
+}
+
 /// Alt pressed during a move makes a copy, which snaps to the original it leaves behind (as
 /// gathered before the previews moved it); released, the move doesn't.
 #[test]
