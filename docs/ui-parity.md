@@ -1,6 +1,6 @@
 # UI and interaction parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-30 · **Change:** minor (Color Effects add-on: live Vector Halftone; scores unchanged) · **Target:** Adobe Illustrator 2026 (30.x)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-11-11 · **Change:** minor (Cmd/Ctrl lends Direct Selection to the Selection tool; scores unchanged) · **Target:** Adobe Illustrator 2026 (30.x)
 
 ## Feature submission evidence
 
@@ -79,6 +79,7 @@ tools, never checked side by side) isn't captured row by row.
 | Click the last anchor to retract its outgoing handle; drag from it to pull a new one | done | |
 | Alt over a handle, anchor or segment acts as the Anchor Point tool | done | |
 | Cmd/Ctrl lends the last-used selection tool | done | the path being drawn continues afterwards |
+| Cmd/Ctrl held with the Selection tool lends Direct Selection (#6583) | done | the press and the pointer are Direct Selection's, the Selection tool is back at the release with the selection kept; not while a drag is under way (Cmd pressed after the press lends nothing); not with Shift (Cmd+Shift releases guides); with Command Click to Select Objects Behind on, only over an anchor, handle end or segment of a selected object, elsewhere Cmd-click still selects behind; `crates/engine/src/tests/cmd_direct.rs` |
 | Click an open path's end to continue it; click another path's end to join | done | #776 |
 | Rubber Band preview | done | Preferences option |
 | Auto Add/Delete on a selected path; Shift or the preference disables it | done | |
@@ -370,6 +371,7 @@ separate. Scores and hours unchanged. [Behavior and command details](development
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-11 | minor | #6583: Cmd/Ctrl held with the Selection tool lends Direct Selection (pointer and press), keeping Select Behind away from a selected object's anchors, handles and segments; scores and estimates unchanged |
 | 2026-10-30 | minor | Color Effects add-on: live Vector Halftone; scores and estimates unchanged |
 | 2026-10-30 | minor | Path Precision Tools add-on: the Parametric Shape Tool (ten re-editable shape kinds), its panel and Convert to Parametric Shape; scores and estimates unchanged |
 | 2026-10-30 | minor | Smart Pen add-on: an Alt-drag away from paths selects points with a marquee; scores and estimates unchanged |

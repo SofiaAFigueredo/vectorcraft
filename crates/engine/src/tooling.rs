@@ -147,11 +147,23 @@ impl Session {
     /// Direct Selection to the tools that edit anchors (the Pen) and Selection to the others.
     /// Cmd+Alt lends Group Selection while Direct Selection is active. Cmd still lends the last
     /// selection tool from other tools (Alt on the lent Direct Selection gesture stays copy/subtract).
+    /// Cmd lends Direct Selection while the Selection tool is active, with two exceptions that keep
+    /// their own meaning for the key: with Shift held (Cmd+Shift releases guides), and, with
+    /// General › Command Click to Select Objects Behind on, away from the anchors, handles and
+    /// segments of a selected object (`p`, in document space), where Cmd-click selects behind.
     /// None for the other selection tools and the view tools.
-    fn lent_tool(&self, id: &str, mods: &Mods) -> Option<&'static str> {
+    fn lent_tool(&mut self, id: &str, mods: &Mods, p: Point, view: ViewInfo) -> Option<&'static str> {
         use vectorcraft_tools::catalog::{edits_anchors, is_selection_tool};
         if matches!(id, "hand" | "zoom" | "rotateView") {
             return None;
+        }
+        if id == "selection" {
+            if mods.shift {
+                return None;
+            }
+            let lends =
+                !self.prefs.ctrl_click_selects_behind || self.with_tool_cx(view, |_, cx| vectorcraft_tools::direct::over_selected_part(cx, p));
+            return lends.then_some("directSelection");
         }
         if id == "directSelection" && mods.cmd && mods.alt {
             return Some("groupSelection");
@@ -165,11 +177,11 @@ impl Session {
     /// A press with Cmd held (Ctrl elsewhere) and any other tool than a selection tool: the
     /// selection tool [`Self::lent_tool`] takes the gesture, pressing without Cmd (a plain click,
     /// not Select Behind). The tool lent to stays as it was, unaware, until the release.
-    fn lend_selection_tool(&mut self, ev: &PointerEvent) -> PointerEvent {
+    fn lend_selection_tool(&mut self, ev: &PointerEvent, view: ViewInfo) -> PointerEvent {
         if ev.kind != PointerKind::Down || !ev.mods.cmd || self.lender.is_some() {
             return *ev;
         }
-        let Some(id) = self.lent_tool(self.tool.id(), &ev.mods) else { return *ev };
+        let Some(id) = self.lent_tool(self.tool.id(), &ev.mods, ev.pos, view) else { return *ev };
         // Typing in progress is kept as its own step first: the lent tool's drag previews from the
         // document its interaction started from, which would drop the typing (#1881).
         if crate::cmd::typing_in_progress(self) {
@@ -350,7 +362,7 @@ impl Session {
             return r;
         }
         self.leave_draw_inside(ev, view)?;
-        let ev = &self.lend_selection_tool(ev);
+        let ev = &self.lend_selection_tool(ev, view);
         let acts = self.with_tool_cx(view, |t, cx| t.pointer(cx, ev));
         let r = self.take_tool_panic().and_then(|()| {
             // A gesture may change options (Alt-drag sizes a Liquify brush): keep them.
@@ -591,9 +603,11 @@ impl Session {
 
     /// The pointer the active tool shows at `p` (General › Use Precise Cursors makes the drawing
     /// tools' a crosshair, [`Cursor::precise`]). With Cmd held, the pointer of the selection tool a
-    /// press would borrow ([`Self::lend_selection_tool`]).
+    /// press would borrow ([`Self::lend_selection_tool`]), but not while a drag is under way: Cmd
+    /// pressed after the press lends nothing, so the tool keeps its pointer until the release.
     pub fn cursor(&mut self, p: Point, mods: Mods, view: ViewInfo) -> Cursor {
-        let lent = if mods.cmd && self.lender.is_none() { self.lent_tool(self.tool.id(), &mods) } else { None };
+        let lends = mods.cmd && self.lender.is_none() && !self.pointer_held;
+        let lent = if lends { self.lent_tool(self.tool.id(), &mods, p, view) } else { None };
         let c = match lent {
             Some(id) => {
                 let lent = self.make_tool(id);
