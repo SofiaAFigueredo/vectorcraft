@@ -14,7 +14,7 @@ use super::{
 /// corners) and simplify it to `tol`. A closed stroke is fitted as the open one is and closed by a
 /// straight segment from its end back to its start: fitting round the gap would curve that segment
 /// on from both ends, past them and back.
-fn fit_freehand(pts: &[Point], tol: f64, closed: bool) -> SubPath {
+pub(super) fn fit_freehand(pts: &[Point], tol: f64, closed: bool) -> SubPath {
     let min = (tol * 0.3).max(vectorcraft_tools::draw2::MIN_FIT_TOLERANCE * 0.3);
     let (Some(&p0), Some(&pn)) = (pts.first(), pts.last()) else { return SubPath::new(vec![], closed) };
     let mut kept: Vec<Point> = vec![p0];

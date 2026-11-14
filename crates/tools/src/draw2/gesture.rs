@@ -1272,7 +1272,9 @@ impl GestureTool {
                     "roundness": self.roundness
                 }),
             )],
-            "knife" if pts.len() >= 2 => vec![Action::Exec("path.knife".into(), json!({"points": points_json(pts)}))],
+            "knife" if pts.len() >= 2 => {
+                vec![Action::Exec("path.knife".into(), json!({"points": points_json(pts), "fidelity": fit_tolerance(cx, self.fidelity)}))]
+            }
             "smooth" if pts.len() >= 2 && has_selected_smooth_path(cx) => {
                 vec![Action::Exec(
                     "path.smoothRegion".into(),
