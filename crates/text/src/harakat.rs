@@ -54,6 +54,9 @@ pub(crate) fn paint_only(a: &CharStyle, b: &CharStyle) -> bool {
         tracking,
         kerning,
         kerning_before: _,
+        aki_left: _,
+        aki_right: _,
+        tsume: _,
         optical_kerning,
         baseline_shift,
         h_scale,
@@ -73,6 +76,11 @@ pub(crate) fn paint_only(a: &CharStyle, b: &CharStyle) -> bool {
         tcy_up_down,
         tcy_left_right,
         standard_vertical_roman,
+        warichu,
+        warichu_lines,
+        warichu_gap,
+        warichu_scale,
+        warichu_align,
         digits,
         font_height_reference,
         no_break,
@@ -121,6 +129,11 @@ pub(crate) fn paint_only(a: &CharStyle, b: &CharStyle) -> bool {
         && tcy_up_down == &b.tcy_up_down
         && tcy_left_right == &b.tcy_left_right
         && standard_vertical_roman == &b.standard_vertical_roman
+        && warichu == &b.warichu
+        && warichu_lines == &b.warichu_lines
+        && warichu_gap == &b.warichu_gap
+        && warichu_scale == &b.warichu_scale
+        && warichu_align == &b.warichu_align
         && digits == &b.digits
         && font_height_reference == &b.font_height_reference
         && no_break == &b.no_break

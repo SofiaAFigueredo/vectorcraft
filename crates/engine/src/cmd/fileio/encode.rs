@@ -2,11 +2,13 @@
 //! (unknown keys are ignored, so one params object can carry the options of several formats).
 
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use vectorcraft_doc::{Artboard, Document};
+use vectorcraft_doc::{Artboard, Document, Node, NodeKind};
 use vectorcraft_geom::Rect;
 use vectorcraft_render::AntiAlias;
 use vectorcraft_render::encode::jpeg::{self, JpegOptions};
@@ -74,16 +76,102 @@ pub struct Encoded {
     pub linked: Vec<vectorcraft_svg::LinkedImage>,
     /// Image maps, each written beside its image under the image's name (raster `imageMap`).
     pub maps: Vec<imagemap::Map>,
-    /// The encoder's warnings (features approximated or left out, options not applied yet).
+    /// The encoder's warnings: what the file leaves out of the document or writes differently
+    /// ([`NoteKind::Loss`]).
     pub warnings: Vec<String>,
+    /// The encoder's notes on the options: options not applied yet or applied another way, and
+    /// what an option turns off ([`NoteKind::Setting`]). A reply gives them after the warnings
+    /// ([`Self::notes`]).
+    pub setting_notes: Vec<String>,
     /// What joins the file's stem and the artboard name when there is a file per artboard
     /// (default `-`; EPS uses `_`, as the reference app names them).
     pub joiner: Option<&'static str>,
 }
 
+/// What a note an export gives with its file is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteKind {
+    /// Something of the document (its art, type, layers or artboards) that the file leaves out or
+    /// that reaches it changed: the format, its version or a limit can't hold it, or the export
+    /// couldn't write it.
+    Loss,
+    /// An option the export didn't apply or applied another way while the art reaches the file as
+    /// it looks, or something left out because an option turns it off.
+    Setting,
+}
+
+/// A note an export gives with its file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Note {
+    /// What the note is about.
+    pub kind: NoteKind,
+    /// The note, in English.
+    pub text: String,
+}
+
+impl Note {
+    /// A note about what the file loses ([`NoteKind::Loss`]).
+    pub fn loss(text: impl Into<String>) -> Self {
+        Self { kind: NoteKind::Loss, text: text.into() }
+    }
+
+    /// A note on the options ([`NoteKind::Setting`]).
+    pub fn setting(text: impl Into<String>) -> Self {
+        Self { kind: NoteKind::Setting, text: text.into() }
+    }
+}
+
+/// The texts of `notes` in the order a reply gives them: the losses first, then the notes on the
+/// options, each kind in the order given (the status bar names the first).
+pub fn note_texts(notes: &[Note]) -> Vec<String> {
+    let of = |kind| notes.iter().filter(move |n| n.kind == kind).map(|n| n.text.clone());
+    of(NoteKind::Loss).chain(of(NoteKind::Setting)).collect()
+}
+
+/// Add `note` to `notes` unless a note with its text is there already.
+pub(super) fn add_note(notes: &mut Vec<Note>, note: Note) {
+    if !notes.iter().any(|n| n.text == note.text) {
+        notes.push(note);
+    }
+}
+
 impl Encoded {
     pub(super) fn one(bytes: Vec<u8>) -> Self {
         Self { files: vec![(None, bytes)], ..Self::default() }
+    }
+
+    /// The file `bytes` with `notes`, each in the list of its kind, in the order given.
+    pub(super) fn one_with_notes(bytes: Vec<u8>, notes: Vec<Note>) -> Self {
+        let mut enc = Self::one(bytes);
+        for n in notes {
+            match n.kind {
+                NoteKind::Loss => enc.warnings.push(n.text),
+                NoteKind::Setting => enc.setting_notes.push(n.text),
+            }
+        }
+        enc
+    }
+
+    /// Add each of `texts` to [`Self::setting_notes`] unless a note with its text is there already.
+    pub(super) fn add_setting_notes(&mut self, texts: impl IntoIterator<Item = String>) {
+        for t in texts {
+            if !self.warnings.contains(&t) && !self.setting_notes.contains(&t) {
+                self.setting_notes.push(t);
+            }
+        }
+    }
+
+    /// Every note with its kind: the warnings, then the notes on the options that aren't also
+    /// warnings.
+    pub fn kinded_notes(&self) -> Vec<Note> {
+        let settings = self.setting_notes.iter().filter(|t| !self.warnings.contains(t)).map(Note::setting);
+        self.warnings.iter().map(Note::loss).chain(settings).collect()
+    }
+
+    /// The notes' texts in the order a reply gives them ([`note_texts`]): the warnings, then the
+    /// notes on the options, each once.
+    pub fn notes(&self) -> Vec<String> {
+        note_texts(&self.kinded_notes())
     }
 
     /// Every file to write for the destination `path` (a path or a file name): the file itself
@@ -128,13 +216,14 @@ impl Encoded {
         out
     }
 
-    /// The one file and the warnings, when the export wrote nothing else.
-    fn single(self, f: &Format) -> Result<(Vec<u8>, Vec<String>)> {
+    /// The one file and the notes, when the export wrote nothing else.
+    fn single(self, f: &Format) -> Result<(Vec<u8>, Vec<Note>)> {
         if !self.linked.is_empty() || !self.maps.is_empty() {
             return Err(bad(C, format!("{} with linked images or an image map writes several files: use document.export", f.label)));
         }
+        let notes = self.kinded_notes();
         match <[_; 1]>::try_from(self.files) {
-            Ok([(_, bytes)]) => Ok((bytes, self.warnings)),
+            Ok([(_, bytes)]) => Ok((bytes, notes)),
             Err(_) => Err(bad(C, format!("{} writes one file per artboard here: use document.export, or name one artboard", f.label))),
         }
     }
@@ -321,13 +410,132 @@ pub(crate) fn anti_alias(id: &str) -> std::result::Result<AntiAlias, String> {
 
 /// The `useArtboards` param of a PDF, AI, DXF or raster export (SVG has its own): `true` writes every
 /// chosen artboard (default all), `false` the bounds of the visible art instead, absent one
-/// artboard (raster, DXF) or the chosen pages (PDF, AI).
-fn use_artboards(p: &Value) -> Result<Option<bool>> {
+/// artboard (raster, DXF) or the chosen pages (PDF, AI). Errors name the command `cmd`.
+pub(super) fn use_artboards(cmd: &str, p: &Value) -> Result<Option<bool>> {
     match p.get("useArtboards") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
-        Some(v) => Err(bad(C, format!("useArtboards must be true or false, not {v}"))),
+        Some(v) => Err(bad(cmd, format!("useArtboards must be true or false, not {v}"))),
     }
+}
+
+/// With `useArtboards: false` in `p`: `doc` without its opacity-mask or symbol editing layer and
+/// with one artboard, the bounds of its visible art, and `p` without the artboard choice. `None`
+/// when `useArtboards` is absent, null or true. The objects that `left_out` picks (layers or
+/// objects the format leaves out, see [`hidden_nodes`]) are not measured, and a document with no
+/// other visible art is refused.
+pub(super) fn art_page(cmd: &str, doc: &Document, p: &Value, left_out: impl Fn(&Node) -> bool) -> Result<Option<(Document, Value)>> {
+    if use_artboards(cmd, p)? != Some(false) {
+        return Ok(None);
+    }
+    let doc = &*doc.without_edit_modes();
+    let bounds = bounds_without(doc, &left_out).ok_or_else(|| bad(cmd, "nothing to export: the document has no visible art"))?;
+    let mut q = super::export::without_artboards(p);
+    if let Some(o) = q.as_object_mut() {
+        o.remove("useArtboards");
+    }
+    Ok(Some((single_artboard(doc, bounds, "Art"), q)))
+}
+
+/// The bounds of the visible art of `doc` that a `format` file of the art's bounds draws, as
+/// [`art_page`] measures it with that format's default options: for HP-GL without what a plot
+/// leaves out ([`vectorcraft_cad::hpgl::write::plots_nothing`]), for other formats all of it (the
+/// non-printing layers a PDF leaves out depend on options chosen after the save panel). `None`
+/// when there is none, which such an export refuses.
+pub fn export_art_bounds(doc: &Document, format: &str) -> Option<Rect> {
+    let doc = &*doc.without_edit_modes();
+    bounds_without(doc, &|n| format == "hpgl" && vectorcraft_cad::hpgl::write::plots_nothing(doc, n))
+}
+
+/// The bounds of the visible art of `doc` with the objects that `left_out` picks hidden
+/// ([`hidden_nodes`]) and the ones in the art of the symbols that instances show taken out
+/// ([`without_nodes`]: symbol art is measured with its hidden objects). An instance of a symbol
+/// whose art is all picked or hidden is hidden too. The art of a dynamic symbol is measured whole:
+/// an instance can paint its objects, and finds them by their places in the art.
+fn bounds_without(doc: &Document, left_out: &dyn Fn(&Node) -> bool) -> Option<Rect> {
+    // The symbols instances show (the first of each name) that aren't dynamic.
+    let mut names = HashSet::new();
+    let shown: Vec<(usize, &vectorcraft_doc::Symbol)> =
+        doc.symbols.iter().enumerate().filter(|(_, s)| names.insert(s.name.as_str())).filter(|(_, s)| !s.dynamic).collect();
+    // The symbols whose art `left_out` leaves nothing of, those that only hold instances of such
+    // symbols included.
+    let mut empty: HashSet<&str> = HashSet::new();
+    while let Some((_, s)) = shown.iter().find(|(_, s)| !empty.contains(s.name.as_str()) && all_left_out(&s.art, left_out, &empty)) {
+        empty.insert(&s.name);
+    }
+    let left_out =
+        &|n: &Node| left_out(n) || matches!(&n.kind, NodeKind::SymbolInstance { symbol, .. } if empty.contains(symbol.as_str()) && !has_effects(n));
+    let layers = hidden_nodes(&doc.layers, left_out);
+    let symbols: Vec<(usize, Arc<Node>)> = shown
+        .iter()
+        .filter(|(_, s)| !empty.contains(s.name.as_str()))
+        .filter_map(|(i, s)| without_nodes(&s.art, left_out).map(|art| (*i, art)))
+        .collect();
+    if layers.is_none() && symbols.is_empty() {
+        return vectorcraft_render::encode::art_bounds(doc);
+    }
+    let mut d = doc.clone();
+    if let Some(layers) = layers {
+        d.layers = layers;
+    }
+    for (i, art) in symbols {
+        if let Some(s) = d.symbols.get_mut(i) {
+            s.art = art;
+        }
+    }
+    vectorcraft_render::encode::art_bounds(&d)
+}
+
+/// Whether `n` is hidden, picked by `left_out`, an instance of one of the `empty` symbols, or a
+/// layer or a group holding only such objects (its clipping path among them when it clips). A
+/// Shaper group, or a layer, group or instance with effects, fills or strokes of its own, is none
+/// of these unless it is hidden or picked.
+fn all_left_out(n: &Node, left_out: &dyn Fn(&Node) -> bool, empty: &HashSet<&str>) -> bool {
+    !n.visible
+        || left_out(n)
+        || !has_effects(n)
+            && n.extras().shaper.is_none()
+            && match &n.kind {
+                NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } => children.iter().all(|c| all_left_out(c, left_out, empty)),
+                NodeKind::SymbolInstance { symbol, .. } => empty.contains(symbol.as_str()),
+                _ => false,
+            }
+}
+
+/// Whether `n` has a visible effect, fill or stroke of its own, which the objects it holds can
+/// take part in.
+fn has_effects(n: &Node) -> bool {
+    n.appearance.effects.iter().any(|e| e.visible) || n.appearance.items.iter().any(|i| i.visible())
+}
+
+/// `n` without the objects that `left_out` picks in it, when it is a layer or a group, and in the
+/// layers and groups in it at any depth; `None` when it picks none of them. A clipping layer or
+/// group keeps its clipping path, its first object, and a Shaper group and a layer or group with
+/// effects, fills or strokes of its own keep all they hold.
+fn without_nodes(n: &Arc<Node>, left_out: &dyn Fn(&Node) -> bool) -> Option<Arc<Node>> {
+    let (NodeKind::Layer { children, clip, .. } | NodeKind::Group { children, clip }) = &n.kind else { return None };
+    if has_effects(n) || n.extras().shaper.is_some() {
+        return None;
+    }
+    let mut changed = false;
+    let kept: Vec<Arc<Node>> = children
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            if left_out(c) && !(*clip && i == 0) {
+                changed = true;
+                return None;
+            }
+            Some(without_nodes(c, left_out).inspect(|_| changed = true).unwrap_or_else(|| c.clone()))
+        })
+        .collect();
+    changed.then(|| {
+        let mut new = (**n).clone();
+        if let NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } = &mut new.kind {
+            *children = kept;
+        }
+        Arc::new(new)
+    })
 }
 
 /// The `rect` param of a raster export: `[x, y, width, height]` in points, y down. `None` when
@@ -378,6 +586,35 @@ pub(crate) fn with_single_artboard(mut d: Document, rect: Rect, name: &str) -> D
     d
 }
 
+/// `nodes` with the visible objects that `left_out` picks hidden, in layers, sublayers and groups
+/// that don't clip, at any depth (what an object it picks holds is not looked at); `None` when it
+/// picks none of them. Clipping layers are looked in too, as their sublayers can be picked.
+pub(super) fn hidden_nodes(nodes: &[Arc<Node>], left_out: &dyn Fn(&Node) -> bool) -> Option<Vec<Arc<Node>>> {
+    let mut out: Option<Vec<Arc<Node>>> = None;
+    for (i, l) in nodes.iter().enumerate() {
+        let new = if left_out(l) {
+            l.visible.then(|| {
+                let mut n = (**l).clone();
+                n.visible = false;
+                Arc::new(n)
+            })
+        } else {
+            let (NodeKind::Layer { children, .. } | NodeKind::Group { children, clip: false }) = &l.kind else { continue };
+            hidden_nodes(children, left_out).map(|c| {
+                let mut n = (**l).clone();
+                if let NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } = &mut n.kind {
+                    *children = c;
+                }
+                Arc::new(n)
+            })
+        };
+        if let Some(slot) = new.and_then(|new| Some((out.get_or_insert_with(|| nodes.to_vec()).get_mut(i)?, new))) {
+            *slot.0 = slot.1;
+        }
+    }
+    out
+}
+
 fn boards<T>(r: std::result::Result<T, String>) -> Result<T> {
     r.map_err(|e| bad(C, e))
 }
@@ -419,8 +656,14 @@ pub fn encode(doc: &Document, format: &str, p: &Value) -> Result<Vec<u8>> {
 
 /// Like [`encode`], also returning the encoder's warnings (PDF and SVG: options not applied yet,
 /// features approximated or left out; every format that draws type: fonts written in the fallback
-/// font; PDF, EPS, SVG, EMF, WMF and the raster formats: type that doesn't fit its frame).
+/// font; PDF, EPS, SVG, EMF, WMF and the raster formats: type that doesn't fit its frame), what
+/// the file loses first ([`note_texts`]).
 pub fn encode_with_warnings(doc: &Document, format: &str, p: &Value) -> Result<(Vec<u8>, Vec<String>)> {
+    encode_with_notes(doc, format, p).map(|(bytes, notes)| (bytes, note_texts(&notes)))
+}
+
+/// Like [`encode_with_warnings`], with each note's kind ([`Encoded::kinded_notes`]).
+pub fn encode_with_notes(doc: &Document, format: &str, p: &Value) -> Result<(Vec<u8>, Vec<Note>)> {
     let f = super::writable(C, Some(format), None)?;
     let enc = encode_all(doc, f.id, p)?;
     // The error for a version 7 .ai of several artboards names the legacy .ai.
@@ -476,7 +719,7 @@ fn encode_all_of(doc: &Document, format: &str, p: &Value) -> Result<Encoded> {
 /// ([`vectorcraft_plugins::export`]). The plug-in is given the native file's JSON
 /// ([`vectorcraft_format::json_part`]) and `p`'s `params`, for the file `p`'s `path` names (else
 /// one named after the document) with that path's extension when the plug-in lists it, else its
-/// first. Its warnings come back with the file.
+/// first. Its warnings come back with the file, as losses (the plug-in gives them no kind).
 fn plugin_file(doc: &Document, plugin: &vectorcraft_plugins::Plugin, f: &Format, p: &Value) -> Result<Encoded> {
     use vectorcraft_plugins::{Error, export};
     let doc = &*doc.without_edit_modes();
@@ -503,7 +746,7 @@ fn encode_files(doc: &Document, f: &Format, p: &Value) -> Result<Encoded> {
     let doc = &*doc.without_edit_modes();
     let n = doc.artboards.len();
     // SVG reads its own `useArtboards` (an SVG option).
-    let use_artboards = if f.raster || matches!(f.id, "pdf" | "ai" | "dxf" | "emf" | "wmf" | "hpgl") { use_artboards(p)? } else { None };
+    let use_artboards = if f.raster || matches!(f.id, "pdf" | "ai" | "dxf" | "emf" | "wmf" | "hpgl") { use_artboards(C, p)? } else { None };
     // `rect`: that area of the page, as if it were the only artboard (the document is not changed).
     if let Some(rect) = page_rect(f, p)? {
         let mut q = super::export::without_artboards(p);
@@ -513,13 +756,25 @@ fn encode_files(doc: &Document, f: &Format, p: &Value) -> Result<Encoded> {
         }
         return encode_files(&single_artboard(doc, rect, "Rect"), f, &q);
     }
-    if use_artboards == Some(false) {
-        let bounds = vectorcraft_render::encode::art_bounds(doc).ok_or_else(|| bad(C, "nothing to export: the document has no visible art"))?;
-        let mut q = super::export::without_artboards(p);
-        if let Some(o) = q.as_object_mut() {
-            o.remove("useArtboards");
-        }
-        return encode_files(&single_artboard(doc, bounds, "Art"), f, &q);
+    // A PDF of the art's bounds carries no editing data (it would replace the artboards).
+    if use_artboards == Some(false)
+        && f.id == "pdf"
+        && let Some((bytes, notes)) = super::pdf::encode_art_page(C, doc, p)?
+    {
+        return Ok(Encoded::one_with_notes(bytes, notes));
+    }
+    // So does a `.ai` file of the art's bounds (a legacy version 7 `.ai` file has none to leave out).
+    if use_artboards == Some(false)
+        && f.id == "ai"
+        && let Some(enc) = super::save::encode_ai_art_page(C, f, doc, p)?
+    {
+        return Ok(enc);
+    }
+    let left_out = |n: &Node| f.id == "hpgl" && vectorcraft_cad::hpgl::write::plots_nothing(doc, n);
+    if use_artboards == Some(false)
+        && let Some((art, q)) = art_page(C, doc, p, left_out)?
+    {
+        return encode_files(&art, f, &q);
     }
     let bytes = match f.id {
         "vectorcraft" => super::native::encode(C, f, doc, p)?,
@@ -539,8 +794,8 @@ fn encode_files(doc: &Document, f: &Format, p: &Value) -> Result<Encoded> {
         "hpgl" => return super::hpgl::encode(doc, p, use_artboards),
         "ai" => return super::save::encode_ai(C, f, doc, p),
         "pdf" => {
-            let (bytes, warnings) = super::pdf::encode(C, doc, p)?;
-            return Ok(Encoded { warnings, ..Encoded::one(bytes) });
+            let (bytes, notes) = super::pdf::encode(C, doc, p)?;
+            return Ok(Encoded::one_with_notes(bytes, notes));
         }
         "png" | "jpg" | "webp" | "gif" | "png8" | "tiff" | "bmp" | "tga" | "psd" => {
             let o: RasterOptions = options(f, p)?;
@@ -607,7 +862,7 @@ fn encode_files(doc: &Document, f: &Format, p: &Value) -> Result<Encoded> {
             let regions: Vec<Rect> = enc.files.iter().filter_map(|(b, _)| b.and_then(|b| doc.artboards.get(b))).map(|a| a.rect).collect();
             enc.warnings.extend(crate::cmd::fonts::export_overflow_warning(doc, &doc.layers, Some(&regions)));
             if format == RasterFormat::WebP && o.lossless == Some(false) {
-                enc.warnings.push("lossy WebP isn't available yet: the file is lossless (exact, but larger)".into());
+                enc.setting_notes.push("lossy WebP isn't available yet: the file is lossless (exact, but larger)".into());
             }
             return Ok(enc);
         }

@@ -396,6 +396,23 @@ fn an_app_that_leaves_has_its_copies_offered_at_once() {
     }
 }
 
+/// The folder copies go to: the `recoveryFolder` preference, trimmed, when it names one, else the
+/// folder the app sets; none with a store the host installed. The web build has no folders.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_folder_in_use_is_the_preference_or_the_apps() {
+    let mut s = Session::new();
+    assert_eq!(cmd::recovery::folder(&s), None);
+    s.recovery.set_default_folder(Some("/app/recovery".into()));
+    assert_eq!(cmd::recovery::folder(&s), Some(("/app/recovery".into(), false)));
+    s.prefs.recovery_folder = " \t ".into();
+    assert_eq!(cmd::recovery::folder(&s), Some(("/app/recovery".into(), false)));
+    s.prefs.recovery_folder = "  /chosen/copies ".into();
+    assert_eq!(cmd::recovery::folder(&s), Some(("/chosen/copies".into(), true)));
+    s.recovery.set_store(Arc::new(MemoryStore::default()));
+    assert_eq!(cmd::recovery::folder(&s), None);
+}
+
 #[test]
 fn folder_areas_are_locked_by_running_apps() {
     let dir = std::env::temp_dir().join(format!("vc-recovery-locks-{}", std::process::id()));
@@ -1177,6 +1194,31 @@ fn a_keeps_entry_in_a_running_apps_area_keeps_the_copies() {
     assert_eq!(restored(b.execute("file.recovery.restore", &json!({})).unwrap()), 0);
     drop(c);
     assert_eq!(offered(&mut b).len(), 2);
+}
+
+/// An entry `<area>/keeps-<left area>` in a crashed app's area keeps nothing while restore or
+/// discard holds that area: both crashed apps' copies are restored, and discarded.
+#[test]
+fn a_keeps_entry_in_a_crashed_apps_area_held_by_the_same_command_keeps_nothing() {
+    let crashed = |store: &Arc<MemoryStore>| {
+        let mut s = session_in(store);
+        s.execute("file.recovery.save", &json!({})).unwrap();
+        s.recovery.own_area().unwrap().to_string()
+    };
+    for cmd in ["file.recovery.restore", "file.recovery.discard"] {
+        let store = Arc::new(MemoryStore::default());
+        let a = crashed(&store);
+        let c = crashed(&store);
+        assert_ne!(a, c);
+        // The area that sorts first, which the command holds first, keeps the other one's copies.
+        let (first, second) = if a < c { (a, c) } else { (c, a) };
+        store.write(&format!("{first}/keeps-{second}"), b"").unwrap();
+        let mut b = relaunch(&store);
+        assert_eq!(offered(&mut b).len(), 2);
+        let r = b.execute(cmd, &json!({})).unwrap();
+        let done = if cmd == "file.recovery.restore" { restored(r) } else { r["discarded"].as_array().unwrap().len() };
+        assert_eq!(done, 2, "{cmd}");
+    }
 }
 
 /// An entry `<area>/keeps-<left area>` in a folder whose lock file can't be opened keeps nothing.

@@ -187,6 +187,9 @@ pub struct HpglOutput {
     pub pens: Vec<[u8; 3]>,
     /// What was approximated or left out.
     pub warnings: Vec<String>,
+    /// Notes on the options: sorting the paths or drawing the inner paths first was applied only
+    /// in part.
+    pub setting_notes: Vec<String>,
 }
 
 /// Write the visible art of `doc` over `opts.region` as an HP-GL plot. Live geometry effects are
@@ -280,10 +283,11 @@ pub fn export_regions(doc: &Document, opts: &HpglOptions, regions: &[Rect]) -> R
         if !by_pen.iter().all(Vec::is_empty) {
             pen_warnings.iter().for_each(|w| warn(&mut warnings, w));
         }
+        let mut setting_notes = vec![];
         if opts.sort || opts.inside_first {
             let (mut at, mut work) = ((0, 0), MAX_SORT_WORK);
             for paths in &mut by_pen {
-                at = reorder(paths, at, &mut work, opts.sort, opts.inside_first, &mut warnings);
+                at = reorder(paths, at, &mut work, opts.sort, opts.inside_first, &mut setting_notes);
             }
         }
         if opts.version == Version::Hpgl && by_pen.iter().flatten().flatten().any(|(x, y)| !CLASSIC_RANGE.contains(x) || !CLASSIC_RANGE.contains(y)) {
@@ -293,7 +297,7 @@ pub fn export_regions(doc: &Document, opts: &HpglOptions, regions: &[Rect]) -> R
             Version::Hpgl => plain(&by_pen),
             Version::Hpgl2 => encoded(&by_pen, &pens),
         };
-        out.push(HpglOutput { bytes, pens: pens.clone(), warnings });
+        out.push(HpglOutput { bytes, pens: pens.clone(), warnings, setting_notes });
     }
     Ok(out)
 }
@@ -366,20 +370,20 @@ fn box_dist2(p: (i64, i64), b: [i64; 4]) -> i128 {
 /// for a closed path any of its points (where it then starts); without, the first in paint order.
 /// With `inside_first`, a path is drawn only once every path lying inside it ([`nest::outer`]) is.
 /// Once `work` is spent, the paths left keep paint order, each after the paths inside it with
-/// `inside_first`, with a warning. Returns where the pen stops.
+/// `inside_first`, with a note in `notes`. Returns where the pen stops.
 fn reorder(
     paths: &mut Vec<Vec<(i64, i64)>>,
     mut at: (i64, i64),
     work: &mut u64,
     nearest: bool,
     inside_first: bool,
-    warnings: &mut Vec<String>,
+    notes: &mut Vec<String>,
 ) -> (i64, i64) {
     let boxes: Vec<[i64; 4]> = paths.iter().map(|p| nest::bounds(p)).collect();
     // The paths each path lies inside, and how many paths inside each are still to draw.
     let outer = inside_first.then(|| nest::outer(paths, &boxes, work)).flatten();
     if inside_first && outer.is_none() {
-        warn(warnings, UNNESTED);
+        warn(notes, UNNESTED);
     }
     let mut waiting = vec![0usize; paths.len()];
     for o in outer.iter().flatten().flatten() {
@@ -430,11 +434,11 @@ fn reorder(
         if *work == 0 || best.0 >= left.len() {
             match &outer {
                 Some(outer) => {
-                    warn(warnings, UNSORTED_INSIDE);
+                    warn(notes, UNSORTED_INSIDE);
                     inner_first(left.into_iter().map(|(j, p, _)| (j, p)).collect(), outer, &mut waiting, paths);
                 }
                 None => {
-                    warn(warnings, UNSORTED);
+                    warn(notes, UNSORTED);
                     paths.extend(left.into_iter().map(|(_, p, _)| p));
                 }
             }
@@ -1018,6 +1022,26 @@ impl<'a> Walk<'a> {
 
 fn overlaps(a: Rect, b: Rect) -> bool {
     a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1
+}
+
+/// Whether a plot draws nothing of `n` wherever it is, apart from what every export leaves out
+/// (hidden objects, guides and template layers): an object at 0% opacity, a non-printing layer, a
+/// placed image, a gradient mesh whose every point is at 0% opacity, or a path or compound path
+/// without effects whose fills and strokes paint nothing. An image or a mesh in `doc` with a
+/// visible Crop Marks effect, or with a Vector Halftone effect that makes dots, is not one of them.
+/// A clipping path still clips when the plot draws nothing of it.
+pub fn plots_nothing(doc: &Document, n: &Node) -> bool {
+    let unpainted = || n.appearance.effects.is_empty() && top_stroke(n).is_none() && top_fill(n).is_none();
+    let dots = || vectorcraft_effects::addons::halftone::halftone_art(doc, n).is_some_and(|g| g.children().is_some_and(|c| !c.is_empty()));
+    let adds_art = || vectorcraft_effects::has_crop_marks(n) || dots();
+    n.opacity <= 0.0
+        || match &n.kind {
+            NodeKind::Layer { printable, .. } => !printable,
+            NodeKind::Image(_) => !adds_art(),
+            NodeKind::Mesh(m) => !adds_art() && m.points.iter().all(|p| p.opacity <= 0.0),
+            NodeKind::Path { .. } | NodeKind::Compound { .. } => unpainted(),
+            _ => false,
+        }
 }
 
 /// `nodes` (the children of a clipping container when `clipping`) without the layers and

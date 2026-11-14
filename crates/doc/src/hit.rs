@@ -569,7 +569,7 @@ fn clip_contains(clip: &Node, p: Point) -> bool {
 
 /// The regions `clip` clips to ([`Node::clip_shapes`]), text counted by its frame as in
 /// [`clip_contains`].
-fn clip_regions(clip: &Node) -> Vec<(vectorcraft_geom::BezPath, vectorcraft_geom::FillRule)> {
+pub fn clip_regions(clip: &Node) -> Vec<(vectorcraft_geom::BezPath, vectorcraft_geom::FillRule)> {
     let frame = |n: &Node| {
         let b = n.geometric_bounds()?;
         Some(Node::path(n.id, vectorcraft_geom::shapes::rectangle(b), Default::default()))
@@ -640,7 +640,7 @@ fn source_of(n: &Node, scope: Option<NodeId>) -> bool {
 /// Do clicks and marquees skip the child `i` of `parent` with `scope` isolated? For a Shaper
 /// Group that is its original shapes (its first child), or, in Construction mode, when they are
 /// isolated, the art the group shows.
-fn shaper_hides(parent: &Node, i: usize, scope: Option<NodeId>) -> bool {
+pub fn shaper_hides(parent: &Node, i: usize, scope: Option<NodeId>) -> bool {
     parent.extras().shaper.is_some() && (i == 0) != source_of(parent, scope)
 }
 
@@ -974,43 +974,45 @@ fn hit_any(n: &Node, p: Point, opt: HitOptions, symbols: &SymbolBoxes) -> Option
 /// The art of a symbol instance with its own appearance changes, in the symbol's coordinates, and
 /// how the canvas places each object of it: through the symbol's 9-slice guides when the instance
 /// is scaled by them ([`Document::place_symbol_art`]), otherwise by the instance's transform.
-struct InstanceArt {
+struct InstanceArt<'a> {
     art: Node,
     map: Option<crate::NineSliceMap>,
     xf: vectorcraft_geom::Affine,
+    /// Quick boxes, which measure the instances in the art as it is placed through the guides.
+    boxes: SymbolBoxes<'a>,
 }
 
-impl InstanceArt {
+impl<'a> InstanceArt<'a> {
     /// The art of symbol instance `inst`. `None` for anything else, a missing symbol, or art that
     /// placing through the guides could make more than [`crate::MAX_SYMBOL_NODES`] objects of,
     /// which [`Document::place_symbol_art`] does not place and the canvas does not draw.
-    fn of(doc: &Document, inst: &Node) -> Option<Self> {
+    fn of(doc: &'a Document, inst: &Node) -> Option<Self> {
         let NodeKind::SymbolInstance { symbol, xf } = &inst.kind else { return None };
-        let sym = doc.symbols.iter().find(|s| s.name == *symbol)?;
-        let art = crate::symbol_overrides::dynamic_art(&sym.art, inst);
-        let map = doc.symbol_slice_map(symbol, *xf);
-        if map.as_ref().is_some_and(|m| m.most_placed(&art, doc) > crate::MAX_SYMBOL_NODES) {
+        let boxes = doc.symbol_boxes().quick();
+        let art = crate::symbol_overrides::dynamic_art(boxes.symbol_art(symbol)?, inst);
+        let map = boxes.slice_map(symbol, *xf);
+        if map.as_ref().is_some_and(|m| m.most_placed_with(&art, &boxes) > crate::MAX_SYMBOL_NODES) {
             return None;
         }
-        Some(Self { art, map, xf: *xf })
+        Some(Self { art, map, xf: *xf, boxes })
     }
 
     /// The map that the objects inside group or layer `n` are moved by as one piece: `whole`, the
     /// map of an object around `n` that is moved as one piece, or else the map of the 9-slice cell
     /// `n` lies in ([`crate::NineSliceMap::one_cell`]). `None` when `n` is placed through the guides
     /// object by object.
-    fn whole(&self, n: &Node, doc: &Document, whole: Option<vectorcraft_geom::Affine>) -> Option<vectorcraft_geom::Affine> {
-        whole.or_else(|| self.map.as_ref()?.one_cell(n, doc))
+    fn whole(&self, n: &Node, whole: Option<vectorcraft_geom::Affine>) -> Option<vectorcraft_geom::Affine> {
+        whole.or_else(|| self.map.as_ref()?.one_cell_with(n, &self.boxes))
     }
 
     /// Object `n` of the art placed on the canvas as it is drawn, clip groups included: moved by
     /// `whole` when an object around it is moved as one piece ([`Self::whole`]). `None` when
     /// placing it through the guides could make more than [`crate::MAX_SYMBOL_NODES`] objects, as
     /// [`Document::place_symbol_art`] refuses it.
-    fn place(&self, n: &Node, doc: &Document, whole: Option<vectorcraft_geom::Affine>) -> Option<Node> {
+    fn place(&self, n: &Node, whole: Option<vectorcraft_geom::Affine>) -> Option<Node> {
         match (&self.map, whole) {
             (_, Some(a)) => Some(moved(n, a)),
-            (Some(m), None) => (m.most_placed(n, doc) <= crate::MAX_SYMBOL_NODES).then(|| m.place(n, doc)),
+            (Some(m), None) => (m.most_placed_with(n, &self.boxes) <= crate::MAX_SYMBOL_NODES).then(|| m.place_with(n, &self.boxes)),
             (None, None) => Some(moved(n, self.xf)),
         }
     }
@@ -1018,10 +1020,13 @@ impl InstanceArt {
     /// Object `n` of the art placed on the canvas without clip groups
     /// ([`crate::NineSliceMap::place_unclipped`]), as [`Self::place`] places it and within the
     /// same limit ([`Document::place_symbol_art_unclipped`]).
-    fn place_unclipped(&self, n: &Node, doc: &Document, whole: Option<vectorcraft_geom::Affine>) -> Option<Node> {
+    fn place_unclipped(&self, n: &Node, whole: Option<vectorcraft_geom::Affine>) -> Option<Node> {
         match (&self.map, whole) {
             (_, Some(a)) => Some(moved(n, a)),
-            (Some(m), None) => (m.most_placed_unclipped(n, doc) <= crate::MAX_SYMBOL_NODES).then(|| m.place_unclipped(n, doc)),
+            (Some(m), None) => {
+                let m = m.unclipped();
+                (m.most_placed_with(n, &self.boxes) <= crate::MAX_SYMBOL_NODES).then(|| m.place_with(n, &self.boxes))
+            }
             (None, None) => Some(moved(n, self.xf)),
         }
     }
@@ -1046,15 +1051,14 @@ fn moved(n: &Node, xf: vectorcraft_geom::Affine) -> Node {
 /// draw. `None` when `inst` is not a symbol instance or no editable object of its art is under `p`.
 pub fn symbol_part_at(doc: &Document, inst: &Node, p: Point, opt: HitOptions) -> Option<Vec<u32>> {
     struct Find<'a> {
-        doc: &'a Document,
-        art: &'a InstanceArt,
+        art: &'a InstanceArt<'a>,
         p: Point,
         opt: HitOptions,
         symbols: &'a SymbolBoxes<'a>,
     }
     impl Find<'_> {
         fn hit(&self, n: &Node, whole: Option<vectorcraft_geom::Affine>) -> bool {
-            self.art.place(n, self.doc, whole).is_some_and(|n| hit_any(&n, self.p, self.opt, self.symbols).is_some())
+            self.art.place(n, whole).is_some_and(|n| hit_any(&n, self.p, self.opt, self.symbols).is_some())
         }
         fn skips_guide(&self, n: &Node) -> bool {
             self.opt.skip_guides && matches!(n.kind, NodeKind::Path { guide: true, .. })
@@ -1067,11 +1071,11 @@ pub fn symbol_part_at(doc: &Document, inst: &Node, p: Point, opt: HitOptions) ->
             if path.len() >= crate::symbol_overrides::MAX_PATH_DEPTH {
                 return self.hit(n, whole);
             }
-            let whole = self.art.whole(n, self.doc, whole);
+            let whole = self.art.whole(n, whole);
             if n.clips()
                 && let Some(first) = children.first()
             {
-                let Some(clip) = self.art.place_unclipped(first, self.doc, whole) else { return false };
+                let Some(clip) = self.art.place_unclipped(first, whole) else { return false };
                 if self.opt.clip_outlines
                     && first.visible
                     && !first.locked
@@ -1103,7 +1107,7 @@ pub fn symbol_part_at(doc: &Document, inst: &Node, p: Point, opt: HitOptions) ->
     let art = InstanceArt::of(doc, inst)?;
     let symbols = doc.symbol_boxes();
     let mut path = vec![];
-    Find { doc, art: &art, p, opt, symbols: &symbols }.find(&art.art, &mut path, None).then_some(path)
+    Find { art: &art, p, opt, symbols: &symbols }.find(&art.art, &mut path, None).then_some(path)
 }
 
 /// The outlines of the object at `path` in symbol instance `inst`'s art (see [`symbol_part_at`]),
@@ -1123,11 +1127,11 @@ pub fn symbol_part_outline(doc: &Document, inst: &Node, path: &[u32]) -> Option<
     let mut n = &art.art;
     for &i in path {
         let children = n.children()?;
-        whole = art.whole(n, doc, whole);
+        whole = art.whole(n, whole);
         if i != 0
             && n.clips()
             && let Some(first) = children.first()
-            && let Some(clip) = art.place_unclipped(first, doc, whole)?.geometric_bounds()
+            && let Some(clip) = art.place_unclipped(first, whole)?.geometric_bounds()
         {
             match meet(Some(clip), limit) {
                 Some(r) => limit = Some(r),
@@ -1136,7 +1140,7 @@ pub fn symbol_part_outline(doc: &Document, inst: &Node, path: &[u32]) -> Option<
         }
         n = children.get(usize::try_from(i).ok()?)?;
     }
-    outline_within(&art.place(part, doc, whole)?, limit, &mut out);
+    outline_within(&art.place(part, whole)?, limit, &mut out);
     Some(out)
 }
 
@@ -1356,7 +1360,7 @@ fn marquee_with(doc: &Document, r: Rect, scope: Option<NodeId>, leaves: bool, wh
 /// The part of a marquee `r` in which it can touch the children of `parent`. For a clip group or a
 /// layer with a clipping mask, this is what [`marquee_in_clip`] returns for its clipping path (None
 /// when the marquee misses it); otherwise it is all of `r`.
-fn marquee_in(parent: &Node, r: Rect) -> Option<Rect> {
+pub fn marquee_in(parent: &Node, r: Rect) -> Option<Rect> {
     match parent.children().and_then(|c| c.first()) {
         Some(clip) if parent.clips() => marquee_in_clip(clip, r),
         _ => Some(r),

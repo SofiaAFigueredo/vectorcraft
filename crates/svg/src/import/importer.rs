@@ -140,12 +140,16 @@ impl Importer {
         Some(self.doc.alloc_id())
     }
 
-    /// A new object named after element `id` (unless it has none or a made-up one).
+    /// A new object named after element `id` (unless it has none or a made-up one), noted as
+    /// found when [`Importer::wanted`] lists `id`.
     fn named(&mut self, id: &str, kind: NodeKind) -> Option<Node> {
         let nid = self.alloc_id()?;
         let mut n = Node::new(nid, kind);
         if !id.is_empty() && !made_up(id) {
             n.name = Some(self.name_of(id).to_string());
+            if self.wanted.contains(id) {
+                self.found.entry(id.to_string()).or_insert(nid);
+            }
         }
         Some(n)
     }
@@ -767,6 +771,12 @@ impl Importer {
             .ok()
             .and_then(|r| r.into_dimensions().ok())
             .unwrap_or((size.width().round().max(1.0) as u32, size.height().round().max(1.0) as u32));
+        // A turned CMYK image is stored as the CMYK TIFF of its inks, the size of the PNG usvg got.
+        let cmyk = self.files.stored(i.kind());
+        let (bytes, mime) = match &cmyk {
+            Some(tiff) => (tiff, "image/tiff"),
+            None => (bytes, mime),
+        };
         // A linked file keeps a preview; a placeholder is all a missing one has (its preview).
         let linked = self.files.linked(i.kind());
         let missing = linked.is_some_and(|l| l.missing);
@@ -861,6 +871,8 @@ mod tests {
             max_nodes: 1000,
             error: None,
             nested_svg_images: crate::MAX_NESTED_SVG_IMAGES,
+            wanted: HashSet::new(),
+            found: HashMap::new(),
         };
         let tree = usvg::Tree::from_str(r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#, &usvg::Options::default()).unwrap();
         let res = im.svg_image(&tree, Affine::IDENTITY);

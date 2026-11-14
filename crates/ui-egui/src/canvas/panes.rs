@@ -12,8 +12,8 @@ use super::outline::{c32, node_outline, stroke_path, too_many_anchors};
 use super::view::fit_zoom;
 use super::{
     Affine, CacheKey, Point, Rect, RulerScale, Sense, Stroke, StrokeKind, Tokens, Ui, VectorcraftApp, View, Xf, artboard_edges, cache_key,
-    dim_on_canvas, frame_options, frame_view, grid, guides_of, json, paint_paper, pixel_region, plugin_key, pos2, rulers, shows_artboards,
-    textured_quad, vec2, view_rects,
+    dim_on_canvas, frame_options, frame_view, grid, guides_of, json, paint_paper, pixel_region, placed_key, plugin_key, pos2, rulers,
+    shows_artboards, textured_quad, vec2, view_rects,
 };
 use crate::doc_windows::Win;
 use crate::thumb_worker::ThumbWorker;
@@ -70,9 +70,17 @@ impl Panes {
     }
 
     /// Bring `slot`'s render up to `key` (`size` pixels through `view`), on the worker when there
-    /// is one, then draw the slot's latest render through `xf`, turned and scaled into the view it
-    /// was rendered for.
-    fn draw(&mut self, ctx: &egui::Context, painter: &egui::Painter, xf: &Xf, slot: Slot, frame: PaneFrame) {
+    /// is one, converted into the display profile `display`, then draw the slot's latest render
+    /// through `xf`, turned and scaled into the view it was rendered for.
+    fn draw(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        xf: &Xf,
+        slot: Slot,
+        frame: PaneFrame,
+        display: Option<Arc<vectorcraft_color::cms::display::DisplayTransform>>,
+    ) {
         let (key, doc, ((w, h), view), opts) = frame;
         if !self.worker_started {
             self.worker_started = true;
@@ -99,10 +107,17 @@ impl Panes {
         }
         let current = self.shown.get(&slot).is_some_and(|(k, _)| *k == key) || self.pending.get(&slot) == Some(&key);
         if !current {
+            // The document draws through its own assigned profiles, not the front document's, on
+            // the worker too.
+            let cms = vectorcraft_engine::cmd::colormgmt::doc_cms(&doc);
             let mut queued = false;
             if let Some(worker) = &self.worker {
-                let (job_doc, job_opts) = (doc.clone(), opts.clone());
-                queued = worker.submit(slot, (slot, key.clone()), Box::new(move |r| Some(r.render(&job_doc, w, h, view, &job_opts))));
+                let (job_doc, job_opts, job_display, job_cms) = (doc.clone(), opts.clone(), display.clone(), cms.clone());
+                queued = worker.submit(
+                    slot,
+                    (slot, key.clone()),
+                    Box::new(move |r| Some(render_pane(r, (&job_doc, w, h, view, &job_opts), job_display.as_deref(), job_cms))),
+                );
                 if queued {
                     self.pending.insert(slot, key.clone());
                 } else {
@@ -110,7 +125,8 @@ impl Panes {
                 }
             }
             if !queued {
-                let img = self.renderer.get_or_insert_with(vectorcraft_render::Renderer::new).render(&doc, w, h, view, &opts);
+                let r = self.renderer.get_or_insert_with(vectorcraft_render::Renderer::new);
+                let img = render_pane(r, (&doc, w, h, view, &opts), display.as_deref(), cms);
                 self.upload(ctx, slot, key, &img);
             }
         }
@@ -127,6 +143,19 @@ impl Panes {
             textured_quad(painter, tex.id(), &q, (1.0, 1.0));
         }
     }
+}
+
+/// Render `doc` (`w` × `h` pixels through `view`, with `opts`) through the color settings `cms`,
+/// then convert it into the display profile `display`.
+fn render_pane(
+    r: &mut vectorcraft_render::Renderer,
+    (doc, w, h, view, opts): (&vectorcraft_doc::Document, u32, u32, Affine, &vectorcraft_render::RenderOptions),
+    display: Option<&vectorcraft_color::cms::display::DisplayTransform>,
+    cms: Arc<vectorcraft_color::cms::Cms>,
+) -> vectorcraft_render::Rendered {
+    let mut img = vectorcraft_color::cms::with_active(cms, || r.render(doc, w, h, view, opts));
+    crate::display_profile::convert(display, &mut img.pixels);
+    img
 }
 
 /// The grid of `n` panes in `area`, filled row by row: as many columns as the square root of `n`
@@ -277,8 +306,16 @@ fn fit_pane(v: &mut View, doc: &vectorcraft_doc::Document, rect: egui::Rect, ui_
 /// art, grid, artboards, guides and selected objects, and its rulers and the room of the canvas's
 /// scroll bars, so the document stays where it is when the pane becomes the canvas. True when a
 /// press in the pane asks for its window to become the current one. A floating window draws its
-/// view with this too ([`crate::doc_windows`]).
+/// view with this too ([`crate::doc_windows`]). The document's colors, its paper and transparency
+/// grid included, draw through its own assigned profiles, not the front document's.
 pub(crate) fn pane(app: &mut VectorcraftApp, ui: &Ui, w: Win, cell: egui::Rect) -> bool {
+    let Some(st) = app.session.documents().get(w.0) else { return false };
+    let cms = vectorcraft_engine::cmd::colormgmt::doc_cms(&st.doc);
+    vectorcraft_color::cms::with_active(cms, || draw_pane(app, ui, w, cell))
+}
+
+/// [`pane`], drawn through the color settings in place.
+fn draw_pane(app: &mut VectorcraftApp, ui: &Ui, w: Win, cell: egui::Rect) -> bool {
     let t = Tokens::get(ui.ctx());
     let ppp = ui.ctx().pixels_per_point();
     let (full, rect) = view_rects(app, cell, ppp);
@@ -305,15 +342,17 @@ pub(crate) fn pane(app: &mut VectorcraftApp, ui: &Ui, w: Win, cell: egui::Rect) 
     let pixel = (app.ui.view.pixel_preview && xf.zoom * ppp as f64 > 1.0).then(|| pixel_region(&xf)).flatten();
     let smooth_images = pixel.is_none() || app.session.prefs.anti_aliased_bitmaps;
     let plugins = plugin_key(&mut app.canvas.plugin_keys, &app.session, st);
+    let placed = placed_key(&mut app.canvas.placed_keys, &app.session, st);
     let drawn = v.on_screen(ui_zoom);
-    let mut key = cache_key(app, ui, st, &t, &drawn, (pw, ph, ppp), (pixel, smooth_images, plugins));
+    let mut key = cache_key(app, ui, st, &t, &drawn, (pw, ph, ppp), (pixel, smooth_images, plugins, placed));
     // The current document's drag and Image Trace hold are not this document's, and this view has
     // its own Outline or Preview.
     (key.dragging, key.trace_source, key.outline) = (false, None, v.outline);
     let opts = frame_options(app, &key, st.shown_mask(), smooth_images);
     let (fw, fh, view) = frame_view(pixel, (pw, ph), &drawn, ppp);
     let doc = st.doc.clone();
-    app.canvas.panes.draw(ui.ctx(), &painter, &xf, slot, (key, doc, ((fw, fh), view), opts));
+    let display = app.display_profile.transform(app.session.prefs.monitor_profile_display);
+    app.canvas.panes.draw(ui.ctx(), &painter, &xf, slot, (key, doc, ((fw, fh), view), opts), display);
     let Some(st) = app.session.documents().get(w.0) else { return false };
     if let Some(look) = grid_look.filter(|_| !grids_in_back) {
         grid(&painter, &xf, st.doc.grid.spacing, st.doc.grid.subdivisions, look);

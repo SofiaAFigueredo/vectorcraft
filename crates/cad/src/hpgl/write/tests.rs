@@ -177,6 +177,90 @@ fn meshes_in_blends_are_outlines_and_clear_meshes_draw_nothing() {
     assert_eq!(t.matches("PD").count(), 3, "{t}");
 }
 
+/// `plots_nothing` picks the objects and layers that a plot draws nothing of: a path that paints
+/// nothing, objects at 0% opacity, placed images, meshes with every point at 0% opacity and
+/// non-printing layers, and not a painted path or a mesh.
+#[test]
+fn plots_nothing_picks_what_a_plot_draws_nothing_of() {
+    type Make = fn(&mut Document) -> Node;
+    let cases: [(&str, Make, bool); 7] = [
+        ("stroked", |d| stroked(d, rect(10.0, 10.0, 40.0, 40.0), Color::BLACK), false),
+        ("unpainted", |d| Node::path(d.alloc_id(), rect(10.0, 10.0, 40.0, 40.0), Appearance::basic(Paint::None, Paint::None, 1.0)), true),
+        (
+            "clear",
+            |d| {
+                let mut n = filled(d, rect(10.0, 10.0, 40.0, 40.0), Color::BLACK);
+                n.opacity = 0.0;
+                n
+            },
+            true,
+        ),
+        (
+            "image",
+            |d| {
+                let image = vectorcraft_doc::ImageObject {
+                    key: "raster-1".into(),
+                    width: 4,
+                    height: 2,
+                    xf: Affine::translate((10.0, 20.0)) * Affine::scale(5.0),
+                    link: None,
+                    placement: Default::default(),
+                    pixels: None,
+                };
+                Node::new(d.alloc_id(), NodeKind::Image(Box::new(image)))
+            },
+            true,
+        ),
+        (
+            "image with Crop Marks",
+            |d| {
+                let image = vectorcraft_doc::ImageObject {
+                    key: "raster-1".into(),
+                    width: 4,
+                    height: 2,
+                    xf: Affine::translate((10.0, 20.0)) * Affine::scale(5.0),
+                    link: None,
+                    placement: Default::default(),
+                    pixels: None,
+                };
+                let mut n = Node::new(d.alloc_id(), NodeKind::Image(Box::new(image)));
+                n.appearance.effects.push(vectorcraft_doc::Effect { id: "cropMarks".into(), params: serde_json::json!({}), visible: true });
+                n
+            },
+            false,
+        ),
+        ("mesh", |d| Node::new(d.alloc_id(), NodeKind::Mesh(mesh_at(10.0))), false),
+        (
+            "clear mesh",
+            |d| {
+                let mut clear = mesh_at(10.0);
+                clear.points.iter_mut().for_each(|p| p.opacity = 0.0);
+                Node::new(d.alloc_id(), NodeKind::Mesh(clear))
+            },
+            true,
+        ),
+    ];
+    for (name, make, nothing) in cases {
+        let mut held = None;
+        let d = doc_with(|d| {
+            let n = make(d);
+            held = Some(n.clone());
+            vec![n]
+        });
+        let Some(n) = held else { panic!("{name}") };
+        assert_eq!(plots_nothing(&d, &n), nothing, "{name}");
+        assert_eq!(text(&plot(&d, &opts(&d))) == "IN;PU;SP0;", nothing, "{name}");
+    }
+    let mut d = doc_with(|d| vec![stroked(d, rect(10.0, 10.0, 40.0, 40.0), Color::BLACK)]);
+    let layer = d.layers[0].id;
+    assert!(!plots_nothing(&d, &d.layers[0]));
+    if let Some(NodeKind::Layer { printable, .. }) = d.node_mut(layer).map(|n| &mut n.kind) {
+        *printable = false;
+    }
+    assert!(plots_nothing(&d, &d.layers[0]));
+    assert_eq!(text(&plot(&d, &opts(&d))), "IN;PU;SP0;");
+}
+
 /// Live art that makes more objects than the plot's limit (1,000 in tests) is left out with a
 /// warning.
 #[test]
@@ -852,7 +936,8 @@ fn sorting_measures_a_closed_path_by_its_nearest_point() {
 fn sorting_stops_at_its_budget_and_keeps_every_path() {
     let d = doc_with(|d| (0..600).map(|i| stroked(d, line((1.0 + (i % 100) as f64, 10.0), (1.0 + (i % 100) as f64, 20.0)), Color::BLACK)).collect());
     let out = plot(&d, &HpglOptions { sort: true, ..opts(&d) });
-    assert!(out.warnings.iter().any(|w| w == UNSORTED), "{:?}", out.warnings);
+    assert_eq!(out.setting_notes, [UNSORTED]);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     assert_eq!(text(&out).matches("PD").count(), 600);
 }
 
@@ -944,18 +1029,18 @@ fn inside_first_orders_each_pens_paths() {
 }
 
 /// Finding which of 100 nested rings lie inside which is past the budget: they are drawn in
-/// paint order, with a warning.
+/// paint order, with a note on the option.
 #[test]
 fn inside_first_past_its_budget_draws_in_paint_order() {
     let d = doc_with(|d| (0..100).map(|i| stroked(d, rect(1.0 + 0.4 * f64::from(i), 10.0, 199.0, 90.0), Color::BLACK)).collect());
     let out = plot(&d, &HpglOptions { inside_first: true, ..opts(&d) });
-    assert_eq!(out.warnings, [UNNESTED]);
+    assert_eq!(out.setting_notes, [UNNESTED]);
     let l = lefts(&out);
     assert_eq!(l.len(), 100);
     assert!(l.windows(2).all(|w| w[0] <= w[1]), "{l:?}");
-    // With `sort` too, the budget is spent before sorting starts: paint order, with both warnings.
+    // With `sort` too, the budget is spent before sorting starts: paint order, with both notes.
     let out = plot(&d, &HpglOptions { sort: true, inside_first: true, ..opts(&d) });
-    assert_eq!(out.warnings, [UNNESTED, UNSORTED]);
+    assert_eq!(out.setting_notes, [UNNESTED, UNSORTED]);
     assert_eq!(lefts(&out), l);
 }
 
@@ -969,7 +1054,7 @@ fn inside_first_past_its_sorting_budget_keeps_the_rings_last() {
         v
     });
     let out = plot(&d, &HpglOptions { sort: true, inside_first: true, ..opts(&d) });
-    assert_eq!(out.warnings, [UNSORTED_INSIDE]);
+    assert_eq!(out.setting_notes, [UNSORTED_INSIDE]);
     let l = lefts(&out);
     assert_eq!(l.len(), 602);
     assert_eq!(l.get(600..), Some(&[plu(0.7), plu(0.5)][..]));
