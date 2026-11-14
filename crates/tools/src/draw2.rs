@@ -26,12 +26,51 @@ pub use gesture::GestureTool;
 /// Colour of tool feedback (Illustrator's selection blue).
 pub const FEEDBACK: [u8; 3] = [0x4f, 0x9d, 0xff];
 
-/// The lowest Fidelity (points) the Pencil and Paintbrush take (#3328); the Smooth tool keeps
-/// [`SMOOTH_MIN_FIDELITY`].
+/// The lowest Fidelity the Pencil and Paintbrush take (#3328; screen pixels, points for the Blob
+/// Brush); the Smooth tool keeps [`SMOOTH_MIN_FIDELITY`].
 pub const MIN_FIDELITY: f64 = 0.01;
 
-/// The lowest Fidelity (points) the Smooth tool takes.
+/// The finest tolerance (points) `path.freehand` fits a Pencil or Paintbrush stroke at: the lowest
+/// Fidelity at the highest zoom (64000 %), whose screen pixels the tools send in points (#5729).
+pub const MIN_FIT_TOLERANCE: f64 = MIN_FIDELITY / 640.0;
+
+/// The coarsest tolerance (points) `path.freehand` fits a Pencil or Paintbrush stroke at: the highest
+/// Fidelity the tools and their Tool Options take (100 px) at the lowest zoom (3.13 %), about 3195 pt.
+/// A change to either range changes this bound with it.
+pub const MAX_FIT_TOLERANCE: f64 = 100.0 / 0.0313;
+
+/// The lowest Fidelity (screen pixels) the Smooth tool takes.
 pub const SMOOTH_MIN_FIDELITY: f64 = 0.05;
+
+/// The finest tolerance (points) `path.smoothRegion` refits at: the Smooth tool's lowest Fidelity at
+/// the highest zoom (64000 %), whose screen pixels the tools send in points.
+pub const SMOOTH_MIN_TOLERANCE: f64 = SMOOTH_MIN_FIDELITY / 640.0;
+
+/// The coarsest tolerance (points) `path.smoothRegion` refits at: the highest Fidelity (100 screen
+/// pixels) at the lowest zoom (3.13 %).
+pub const SMOOTH_MAX_TOLERANCE: f64 = 100.0 / 0.0313;
+
+/// Whether segment `i` of `sp` is straight, so the Smooth tool leaves it as it is: its handles lie
+/// on the line through its ends, and the segment runs from one end to the other without turning back.
+pub fn segment_is_straight(sp: &SubPath, i: usize) -> bool {
+    let c = sp.segment(i);
+    let chord = c.p3 - c.p0;
+    let len = chord.hypot();
+    if len < 1e-9 {
+        return c.p1.distance(c.p0) < 1e-9 && c.p2.distance(c.p0) < 1e-9;
+    }
+    // A millionth of a point, and the rounding error of a very long segment's coordinates.
+    let eps = 1e-6 + 1e-9 * len;
+    let off = |q: Point| chord.cross(q - c.p0).abs() / len;
+    if off(c.p1) > eps || off(c.p2) > eps {
+        return false;
+    }
+    // How far along the line the segment moves at its start, middle and end (the Bernstein
+    // coefficients of its speed along it): it never moves backward when these allow no negative.
+    let along = |q: Point| chord.dot(q - c.p0) / len;
+    let (a, b, e) = (along(c.p1), along(c.p2) - along(c.p1), len - along(c.p2));
+    a >= -eps && e >= -eps && (b >= -eps || b * b <= a * e + eps)
+}
 
 /// The lowest Fidelity tool `id` takes.
 pub fn min_fidelity(id: &str) -> f64 {
@@ -234,10 +273,20 @@ pub fn polyline(pts: &[Point]) -> BezPath {
 /// whose long axis runs at `angle` degrees counter-clockwise on the page (y-down document space)
 /// and whose short axis is `roundness` percent of the long one (kept within 1–100).
 pub fn eraser_tip(angle: f64, roundness: f64) -> Affine {
+    ellipse_tip(angle, roundness.clamp(1.0, 100.0))
+}
+
+/// Map a round brush tip to a page-oriented ellipse. 0 percent Roundness is drawn as
+/// 0.1 percent so its inverse is defined.
+pub fn blob_tip(angle: f64, roundness: f64) -> Affine {
+    ellipse_tip(angle, roundness.clamp(0.1, 100.0))
+}
+
+fn ellipse_tip(angle: f64, roundness: f64) -> Affine {
     let t = angle.to_radians();
     let u = Vec2::new(t.cos(), -t.sin());
     let v = Vec2::new(-u.y, u.x);
-    let r = roundness.clamp(1.0, 100.0) / 100.0;
+    let r = roundness / 100.0;
     let (xx, xy, yy) = (u.x * u.x + r * v.x * v.x, u.x * u.y + r * v.x * v.y, u.y * u.y + r * v.y * v.y);
     Affine::new([xx, xy, xy, yy, 0.0, 0.0])
 }
@@ -246,7 +295,15 @@ pub fn eraser_tip(angle: f64, roundness: f64) -> Affine {
 /// `roundness`) covers along `pts`: a round stroke along the points squashed by the tip's map,
 /// stretched back.
 pub fn eraser_area(pts: &[Point], size: f64, angle: f64, roundness: f64) -> PathData {
-    let stretch = eraser_tip(angle, roundness);
+    swept_tip_area(pts, size, eraser_tip(angle, roundness))
+}
+
+/// The filled area covered by a Blob Brush's page-oriented elliptical tip.
+pub fn blob_area(pts: &[Point], size: f64, angle: f64, roundness: f64) -> PathData {
+    swept_tip_area(pts, size, blob_tip(angle, roundness))
+}
+
+fn swept_tip_area(pts: &[Point], size: f64, stretch: Affine) -> PathData {
     let squash = stretch.inverse();
     let mut round: Vec<Point> = pts.iter().map(|p| squash * *p).collect();
     if let [p] = round[..] {
@@ -389,6 +446,22 @@ pub(crate) fn remove_anchor((id, si, ai): (NodeId, usize, usize)) -> Action {
 mod tests {
     use super::*;
     use vectorcraft_geom::ParamCurve;
+
+    /// A segment is straight only when its handles lie on its line between its ends; a bend of 50 pt
+    /// on a segment 100,000,000 pt long is a curve.
+    #[test]
+    fn segment_is_straight_needs_handles_on_the_line_between_the_ends() {
+        let seg = |h1: (f64, f64), h2: (f64, f64), end: f64| {
+            let a = Anchor::with_handles(Point::new(0.0, 0.0), Point::new(0.0, 0.0), Point::new(h1.0, h1.1));
+            let b = Anchor::with_handles(Point::new(end, 0.0), Point::new(h2.0, h2.1), Point::new(end, 0.0));
+            segment_is_straight(&SubPath::new(vec![a, b], false), 0)
+        };
+        assert!(seg((0.0, 0.0), (100.0, 0.0), 100.0));
+        assert!(seg((30.0, 0.0), (70.0, 0.0), 100.0));
+        assert!(!seg((30.0, 1.0), (70.0, 0.0), 100.0));
+        assert!(!seg((150.0, 0.0), (-50.0, 0.0), 100.0), "turns back along its line");
+        assert!(!seg((3e7, 50.0), (7e7, 50.0), 1e8), "a long, gentle bend");
+    }
 
     #[test]
     fn catmull_rom_passes_through_points() {

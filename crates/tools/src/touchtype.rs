@@ -53,16 +53,19 @@ struct CharBox {
     quad: [Point; 4],
     /// The glyph's origin on its shifted baseline, which the scale handles measure from.
     pen: Point,
-    /// Its pen position on the line's baseline, which character rotation turns it about.
+    /// The point character rotation turns it about: its pen position on the line's baseline,
+    /// moved by its baseline shift.
     pivot: Point,
     /// A unit vector along its line in reading order.
     along: Vec2,
-    /// The glyph's own x axis and its up axis (with its rotation, which baseline shift moves it
-    /// along), unit vectors.
+    /// A unit vector up from its line, without its rotation: the way baseline shift moves it. For
+    /// a glyph standing upright in vertical type, the line's cross axis (right of its column).
+    up: Vec2,
+    /// The glyph's own x axis and its up axis (with its rotation), unit vectors.
     ex: Vec2,
     ey: Vec2,
     /// Whether the tool moves it along its line by kerning: a character comes before it on its
-    /// line and it is not right-to-left.
+    /// line in logical order.
     kerned: bool,
     /// Its style as the Character panel shows it (horizontal scale with the object transform).
     style: CharStyle,
@@ -96,7 +99,7 @@ struct Drag {
     began: bool,
 }
 
-/// The type object's layout, keyed by the font database's generation and the object.
+/// The type object's layout, keyed by [`vectorcraft_text::layout_inputs`] and the object.
 type CachedLayout = ((u64, TextObject), Arc<TextLayout>);
 
 #[derive(Default)]
@@ -172,24 +175,31 @@ fn char_box(t: &TextObject, lay: &TextLayout, gi: usize) -> Option<CharBox> {
     }
     let quad = [m * Point::new(x0, y0), m * Point::new(x1, y0), m * Point::new(x1, y1), m * Point::new(x0, y1)];
     let d = Vec2::new(g.angle.cos(), g.angle.sin());
+    // Up from the glyph's frame without its rotation. For a glyph standing upright in vertical
+    // type, that up runs along the column, so the glyph takes the line's cross axis instead: the
+    // way baseline shift moves the column's sideways glyphs.
+    let up = unit(linear(m * g.unturned, Vec2::new(0.0, -1.0)));
+    let up = if d.cross(up).abs() > 1e-6 { up } else { Vec2::new(d.y, -d.x) };
     let style = edit::slice_runs(&t.runs, g.byte, g.byte + g.len).first().map(|r| r.style.clone())?;
     Some(CharBox {
         start: g.byte,
         quad,
         pen,
-        pivot: g.origin,
+        pivot: m * g.pivot,
         along: if g.rtl { -d } else { d },
+        up,
         ex,
         ey,
-        kerned: !g.rtl && lay.glyphs.iter().any(|h| h.line == g.line && h.len > 0 && h.byte + h.len == g.byte),
+        kerned: lay.glyphs.iter().any(|h| h.line == g.line && h.len > 0 && h.byte + h.len == g.byte && h.rtl == g.rtl),
         style: t.effective_char_style(&style)?,
     })
 }
 
 impl TouchTypeTool {
-    /// Layout of `t`, cached by content (overlays run every frame) and by the fonts available.
+    /// Layout of `t`, cached by content (overlays run every frame), by the fonts available and by
+    /// the hyphenation exceptions.
     fn layout(&self, t: &TextObject) -> Arc<TextLayout> {
-        let fonts = FontDb::global().generation();
+        let fonts = vectorcraft_text::layout_inputs();
         let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(((g, k), l)) = c.as_ref()
             && *g == fonts
@@ -239,20 +249,21 @@ impl TouchTypeTool {
     }
 
     /// Document-space move for a character box (`b` of `t`): kerning along the line and baseline
-    /// shift along the character's up axis.
+    /// shift up from it, whatever the character's rotation. The move (text space) is split into
+    /// its parts along the line and up from it; a character that is not kerned only moves up or
+    /// down. When the two axes are parallel, the params hold no move.
     fn move_params(id: NodeId, t: &TextObject, b: &CharBox, moved: Vec2) -> Value {
         let doc_len = |v: Vec2| linear(t.xf, v).hypot();
-        let det = b.along.cross(b.ey);
-        let (along, rise) = if !b.kerned {
-            (0.0, moved.dot(b.ey))
-        } else if det.abs() > 0.1 {
-            (moved.cross(b.ey) / det, b.along.cross(moved) / det)
+        let det = b.along.cross(b.up);
+        let (along, rise) = if det.abs() <= 1e-9 || !det.is_finite() {
+            (0.0, 0.0)
         } else {
-            (moved.dot(b.along), 0.0)
+            let (along, rise) = (moved.cross(b.up) / det, b.along.cross(moved) / det);
+            if b.kerned { (along, rise) } else { (0.0, rise) }
         };
         let mut out = json!({"id": id.0, "start": b.start});
         let dx = along * doc_len(b.along);
-        let dy = rise * doc_len(b.ey);
+        let dy = rise * doc_len(b.up);
         if dx != 0.0 {
             out["dx"] = json!(dx);
         }

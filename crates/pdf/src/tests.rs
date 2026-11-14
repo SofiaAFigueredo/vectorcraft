@@ -8,13 +8,16 @@ use vectorcraft_geom::{Affine, FillRule, PathData, Point, Rect, shapes};
 
 use crate::*;
 
+mod actual_text;
 mod blend;
 mod charstroke;
 mod cmykblend;
 mod cmykimages;
 mod colorize;
 mod compression;
+mod conic;
 mod dashalign;
+mod diamond;
 mod editing;
 mod encrypt;
 mod file_info;
@@ -27,8 +30,10 @@ mod import_lines;
 mod import_options;
 mod import_overprint;
 mod layers;
+mod links;
 pub(super) mod live_text;
 mod marks;
+mod measuring;
 mod mesh_export;
 mod output;
 mod pdf13;
@@ -39,7 +44,9 @@ mod printadvanced;
 mod reader_compat;
 mod reader_streaming;
 mod realtext;
+mod reshaped;
 mod settings;
+mod spread;
 pub(super) mod stroke;
 mod strokeout;
 mod text_placement;
@@ -128,6 +135,7 @@ fn one_page_per_artboard_with_sizes() {
         show_video_safe_areas: false,
         video_ruler_pixel_aspect_ratio: 1.0,
         color: None,
+        guide_label: None,
     });
     d.artboards.push(Artboard {
         id: 3,
@@ -139,6 +147,7 @@ fn one_page_per_artboard_with_sizes() {
         show_video_safe_areas: false,
         video_ruler_pixel_aspect_ratio: 1.0,
         color: None,
+        guide_label: None,
     });
     let bytes = export(&d, &PdfOptions::default()).unwrap();
     let pdf = craft_pdf::syntax::Pdf::new(bytes).unwrap();
@@ -159,6 +168,7 @@ fn artboard_range_and_bad_index() {
         show_video_safe_areas: false,
         video_ruler_pixel_aspect_ratio: 1.0,
         color: None,
+        guide_label: None,
     });
     let bytes = export(&d, &PdfOptions { artboards: Some(vec![1]), ..Default::default() }).unwrap();
     let pdf = craft_pdf::syntax::Pdf::new(bytes).unwrap();
@@ -194,7 +204,7 @@ fn an_instance_whose_art_reaches_the_page_is_written() {
     // the 20 × 20 square around the origin, moved to (-60, -60) to (-40, -40), is off it.
     let mut d = doc(200.0, 100.0);
     let red = rect_node(Rect::new(100.0, 50.0, 140.0, 90.0), Color::rgb(1.0, 0.0, 0.0));
-    let far = vectorcraft_doc::Symbol { name: "Far".into(), art: Arc::new(red) };
+    let far = vectorcraft_doc::Symbol { dynamic: false, name: "Far".into(), art: Arc::new(red) };
     d.symbols.push(far.clone());
     let instance = Node::new(NodeId(0), NodeKind::SymbolInstance { symbol: "Far".into(), xf: Affine::translate((-50.0, -50.0)) });
     add(&mut d, instance.clone());
@@ -228,12 +238,176 @@ fn an_instance_whose_brush_art_reaches_the_page_is_written() {
     let mut stroke = Appearance::basic(Paint::None, Paint::solid(Color::BLACK), 1.0);
     stroke.stroke_mut().unwrap().brush = Some("3 pt. Round".into());
     let line = Node::path(NodeId(0), shapes::line((0.0, 40.0).into(), (0.0, 60.0).into()), stroke);
-    d.symbols.push(vectorcraft_doc::Symbol { name: "Nib".into(), art: Arc::new(line) });
+    d.symbols.push(vectorcraft_doc::Symbol { dynamic: false, name: "Nib".into(), art: Arc::new(line) });
     add(&mut d, Node::new(NodeId(0), NodeKind::SymbolInstance { symbol: "Nib".into(), xf: Affine::translate((-5.0, 0.0)) }));
     let out = roundtrip(&d);
     let l = leaves(&out);
     assert_eq!(l.len(), 1, "the nib's art");
     assert!(close(l[0].geometric_bounds().unwrap(), Rect::new(-15.0, 30.0, 5.0, 70.0), 0.01), "{:?}", l[0].geometric_bounds());
+}
+
+/// The live effects in a symbol's art apply where the instance places the art, as on the canvas:
+/// the symbol's square at (10, 40), which a Transform effect moves 100 pt right, is written at
+/// (110, 40).
+#[test]
+fn symbol_art_effects_are_written_where_they_draw() {
+    let mut d = doc(200.0, 100.0);
+    let mut square = rect_node(Rect::new(10.0, 40.0, 20.0, 50.0), Color::rgb(1.0, 0.0, 0.0));
+    square.appearance.effects.push(vectorcraft_doc::Effect {
+        id: "distort.transform".into(),
+        params: serde_json::json!({"moveH": 100.0}),
+        visible: true,
+    });
+    d.symbols.push(vectorcraft_doc::Symbol { dynamic: false, name: "Moved".into(), art: Arc::new(square) });
+    add(&mut d, Node::new(NodeId(0), NodeKind::SymbolInstance { symbol: "Moved".into(), xf: Affine::IDENTITY }));
+    let out = roundtrip(&d);
+    let l = leaves(&out);
+    assert_eq!(l.len(), 1);
+    assert!(close(l[0].geometric_bounds().unwrap(), Rect::new(110.0, 40.0, 120.0, 50.0), 0.01), "{:?}", l[0].geometric_bounds());
+}
+
+/// An instance of a symbol with 9-slice guides, scaled to 200 × 150, is written as the canvas
+/// draws it: its 10 × 10 corner square stays 10 × 10 and its 10 × 10 center square becomes 30 × 20.
+#[test]
+fn a_scaled_nine_slice_instance_keeps_its_corners() {
+    let mut d = doc(300.0, 200.0);
+    let art = Node::group(
+        NodeId(0),
+        vec![
+            Arc::new(rect_node(Rect::new(0.0, 0.0, 100.0, 100.0), Color::rgb8(200, 200, 200))),
+            Arc::new(rect_node(Rect::new(0.0, 0.0, 10.0, 10.0), Color::rgb(1.0, 0.0, 0.0))),
+            Arc::new(rect_node(Rect::new(45.0, 45.0, 55.0, 55.0), Color::rgb(0.0, 0.0, 1.0))),
+        ],
+    );
+    d.symbols.push(vectorcraft_doc::Symbol { dynamic: false, name: "Panel".into(), art: Arc::new(art) });
+    d.set_symbol_nine_slice("Panel", Some(vectorcraft_doc::SymbolNineSlice::default()));
+    let xf = Affine::translate((20.0, 20.0)) * Affine::scale_non_uniform(2.0, 1.5);
+    add(&mut d, Node::new(NodeId(0), NodeKind::SymbolInstance { symbol: "Panel".into(), xf }));
+    let out = roundtrip(&d);
+    let boxes: Vec<Rect> = leaves(&out).iter().filter_map(|n| n.geometric_bounds()).collect();
+    assert_eq!(boxes.len(), 3, "{boxes:?}");
+    assert!(close(boxes[0], Rect::new(20.0, 20.0, 220.0, 170.0), 0.01), "{boxes:?}");
+    assert!(close(boxes[1], Rect::new(20.0, 20.0, 30.0, 30.0), 0.01), "{boxes:?}");
+    assert!(close(boxes[2], Rect::new(105.0, 85.0, 135.0, 105.0), 0.01), "{boxes:?}");
+}
+
+/// An instance of symbol `name` placed by `xf`, its fill red at `opacity` (shown when `visible`).
+fn stained_instance(name: &str, xf: Affine, opacity: f32, visible: bool) -> Node {
+    let mut n = Node::new(NodeId(0), NodeKind::SymbolInstance { symbol: name.into(), xf });
+    n.appearance = Appearance::basic(Paint::solid(Color::rgb(1.0, 0.0, 0.0)), Paint::None, 0.0).into();
+    n.appearance.items.retain(AppearanceItem::is_fill);
+    if let AppearanceItem::Fill(f) = &mut n.appearance.items[0] {
+        (f.opacity, f.visible) = (opacity, visible);
+    }
+    n
+}
+
+/// The fill colors of `d`'s leaves, in paint order.
+fn leaf_fills(d: &Document) -> Vec<String> {
+    leaves(d).iter().filter_map(|n| n.appearance.fill_paint().color()).map(|c| c.to_hex()).collect()
+}
+
+/// A stained instance is written in the colors the canvas draws it in
+/// ([`vectorcraft_brush::instance_art`]): on its own, with a Transform effect that moves it, inside
+/// a group, after a dynamic symbol's own fill change, and placed through 9-slice guides. A hidden
+/// fill or one at 0% opacity leaves the art's colors as they are.
+#[test]
+fn a_stained_instance_keeps_its_stain() {
+    let blue = Color::rgb8(30, 90, 220);
+    let art = || Node::group(NodeId(0), vec![Arc::new(rect_node(Rect::new(0.0, 0.0, 100.0, 100.0), blue))]);
+    let canvas = |n: &Node| leaf_fills_of(&vectorcraft_brush::instance_art(&art(), n));
+    fn leaf_fills_of(n: &Node) -> Vec<String> {
+        let mut d = doc(10.0, 10.0);
+        add(&mut d, n.clone());
+        leaf_fills(&d)
+    }
+    let write = |n: Node, nine_slice: bool| {
+        let mut d = doc(300.0, 200.0);
+        d.symbols.push(vectorcraft_doc::Symbol { dynamic: true, name: "Panel".into(), art: Arc::new(art()) });
+        if nine_slice {
+            d.set_symbol_nine_slice("Panel", Some(vectorcraft_doc::SymbolNineSlice::default()));
+        }
+        add(&mut d, n);
+        leaf_fills(&roundtrip(&d))
+    };
+    let half = stained_instance("Panel", Affine::translate((20.0, 20.0)), 0.5, true);
+    let want = canvas(&half);
+    assert_ne!(want, [blue.to_hex()], "the stain changes the color");
+    assert_eq!(write(half.clone(), false), want, "on its own");
+    let mut moved = half.clone();
+    moved.appearance.effects.push(vectorcraft_doc::Effect {
+        id: "distort.transform".into(),
+        params: serde_json::json!({"moveH": 30.0}),
+        visible: true,
+    });
+    assert_eq!(write(moved, false), want, "with a geometry effect");
+    assert_eq!(write(Node::group(NodeId(0), vec![Arc::new(half.clone())]), false), want, "in a group");
+    let mut scaled = half.clone();
+    scaled.kind = NodeKind::SymbolInstance { symbol: "Panel".into(), xf: Affine::translate((20.0, 20.0)) * Affine::scale_non_uniform(2.0, 1.5) };
+    assert_eq!(write(scaled, true), want, "through 9-slice guides");
+    let mut changed = half.clone();
+    changed.extras_mut().symbol_overrides =
+        vec![vectorcraft_doc::SymbolOverride { path: vec![0], fill: Some(Paint::solid(Color::rgb(0.0, 1.0, 0.0))), ..Default::default() }];
+    let changed_want = canvas(&changed);
+    assert_ne!(changed_want, want, "the part's own fill is stained");
+    assert_eq!(write(changed, false), changed_want, "after a dynamic symbol's change");
+    for (opacity, visible) in [(0.0, true), (0.5, false)] {
+        assert_eq!(write(stained_instance("Panel", Affine::IDENTITY, opacity, visible), false), [blue.to_hex()], "unstained");
+    }
+}
+
+/// A stained instance of a symbol whose art has a live effect is written in its stained colors,
+/// where the effect draws the art.
+#[test]
+fn a_stained_instance_keeps_its_stain_when_its_art_has_effects() {
+    let blue = Color::rgb8(30, 90, 220);
+    let square = rect_node(Rect::new(10.0, 40.0, 20.0, 50.0), blue);
+    let half = stained_instance("Moved", Affine::IDENTITY, 0.5, true);
+    let want = vectorcraft_brush::instance_art(&square, &half).appearance.fill_paint().color().unwrap().to_hex();
+    assert_ne!(want, blue.to_hex(), "the stain changes the color");
+    let mut art = square;
+    art.appearance.effects.push(vectorcraft_doc::Effect {
+        id: "distort.transform".into(),
+        params: serde_json::json!({"moveH": 100.0}),
+        visible: true,
+    });
+    let mut d = doc(200.0, 100.0);
+    d.symbols.push(vectorcraft_doc::Symbol { dynamic: false, name: "Moved".into(), art: Arc::new(art) });
+    add(&mut d, half);
+    let out = roundtrip(&d);
+    let l = leaves(&out);
+    assert_eq!(l.len(), 1);
+    assert!(close(l[0].geometric_bounds().unwrap(), Rect::new(110.0, 40.0, 120.0, 50.0), 0.01), "{:?}", l[0].geometric_bounds());
+    assert_eq!(leaf_fills(&out), [want]);
+}
+
+/// The placed art of all the 9-slice instances in one export holds at most `MAX_SYMBOL_NODES`
+/// objects, opacity-mask art included, as on the canvas: of two instances whose art placed through
+/// the guides holds about 9,009,000 objects each (a gradient square in all nine cells, each copy
+/// with a disabled opacity mask of 1,001,001 objects), the first is written in its nine cells and
+/// the second is left out. With a small mask both are written.
+#[test]
+fn nine_slice_instances_share_one_object_limit_in_an_export() {
+    let doc = |mask_objects: usize| {
+        let mut d = doc(300.0, 200.0);
+        let leaf = Arc::new(rect_node(Rect::new(0.0, 0.0, 1.0, 1.0), Color::BLACK));
+        let inner = Arc::new(Node::group(NodeId(0), vec![leaf; mask_objects]));
+        let mut mask = vectorcraft_doc::OpacityMask::new(Node::group(NodeId(0), vec![inner; mask_objects]), true);
+        (mask.linked, mask.disabled) = (false, true);
+        let gradient = Paint::Gradient(Box::new(GradientPaint::new(Gradient::default())));
+        let mut square = Node::path(NodeId(0), shapes::rectangle(Rect::new(0.0, 0.0, 100.0, 100.0)), Appearance::basic(gradient, Paint::None, 0.0));
+        square.extras_mut().mask = Some(Box::new(mask));
+        let art = Node::group(NodeId(0), vec![Arc::new(square)]);
+        d.symbols.push(vectorcraft_doc::Symbol { dynamic: false, name: "Panel".into(), art: Arc::new(art) });
+        d.set_symbol_nine_slice("Panel", Some(vectorcraft_doc::SymbolNineSlice::default()));
+        for x in [20.0, 40.0] {
+            let xf = Affine::translate((x, 20.0)) * Affine::scale_non_uniform(2.0, 1.5);
+            add(&mut d, Node::new(NodeId(0), NodeKind::SymbolInstance { symbol: "Panel".into(), xf }));
+        }
+        d
+    };
+    assert_eq!(leaves(&roundtrip(&doc(2))).len(), 18);
+    assert_eq!(leaves(&roundtrip(&doc(1_000))).len(), 9);
 }
 
 #[test]
@@ -692,7 +866,7 @@ fn an_image_whose_pixels_cant_be_decoded_is_left_out_with_one_note() {
 }
 
 /// #2023: a group's Transform effect copies an image among its members as it does the paths: the
-/// PDF draws the image three times, where the effect put it.
+/// PDF draws the image three times, where the effect put it, the original on top.
 #[test]
 fn a_group_transform_effect_exports_its_image_copies() {
     let mut d = doc(200.0, 100.0);
@@ -719,7 +893,7 @@ fn a_group_transform_effect_exports_its_image_copies() {
     let out = roundtrip(&d);
     let lefts: Vec<f64> =
         leaves(&out).iter().filter(|n| matches!(n.kind, NodeKind::Image(_))).filter_map(|n| n.geometric_bounds()).map(|b| b.x0.round()).collect();
-    assert_eq!(lefts, [20.0, 70.0, 120.0]);
+    assert_eq!(lefts, [120.0, 70.0, 20.0]);
 }
 
 /// Build a PDF with a correct xref table from object bodies.
@@ -836,6 +1010,7 @@ fn import_max_pages_and_multi_page() {
         show_video_safe_areas: false,
         video_ruler_pixel_aspect_ratio: 1.0,
         color: None,
+        guide_label: None,
     });
     add(&mut d, rect_node(Rect::new(10.0, 10.0, 50.0, 50.0), Color::BLACK));
     add(&mut d, rect_node(Rect::new(310.0, 10.0, 350.0, 50.0), Color::BLACK));
@@ -971,6 +1146,77 @@ fn opacity_mask_exports_as_luminosity_soft_mask() {
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("/SMask"), "soft mask in an ExtGState");
     assert!(text.contains("/Luminosity"));
+}
+
+/// The warnings and path count after exporting an image mask and a separate rectangle.
+fn image_mask_report(colorized: bool, available: bool, nested: bool, unwritable: bool) -> (Vec<String>, usize) {
+    let mut d = doc(100.0, 100.0);
+    if available {
+        d.images.insert("mask-image".into(), ImageBlob::png(tiny_png()));
+    }
+    let im = ImageObject {
+        key: "mask-image".into(),
+        width: 4,
+        height: 2,
+        xf: Affine::translate(if unwritable { (1e10, 1e10) } else { (10.0, 10.0) }) * Affine::scale(10.0),
+        link: None,
+        placement: Default::default(),
+        pixels: None,
+    };
+    let mut art = Node::new(d.alloc_id(), NodeKind::Image(Box::new(im)));
+    if colorized {
+        art.extras_mut().colorize = Some(Box::new(Paint::solid(Color::rgb(0.0, 0.0, 1.0))));
+    }
+    if nested {
+        let mut outer_art = rect_node(Rect::new(10.0, 10.0, 50.0, 30.0), Color::WHITE);
+        outer_art.extras_mut().mask = Some(Box::new(vectorcraft_doc::OpacityMask::new(art, false)));
+        art = outer_art;
+    }
+    let mut masked = rect_node(Rect::new(10.0, 10.0, 50.0, 30.0), Color::rgb(1.0, 0.0, 0.0));
+    masked.extras_mut().mask = Some(Box::new(vectorcraft_doc::OpacityMask::new(art, false)));
+    add(&mut d, masked);
+    add(&mut d, rect_node(Rect::new(60.0, 60.0, 80.0, 80.0), Color::BLACK));
+    let report = export_with_report(&d, &PdfOptions::uncompressed()).expect("export");
+    let imported = import(&report.bytes).expect("import");
+    let paths = leaves(&imported).into_iter().filter(|n| n.path_data().is_some()).count();
+    (report.warnings, paths)
+}
+
+#[test]
+fn missing_colorized_image_in_unclipped_mask_omits_masked_object() {
+    let (warnings, paths) = image_mask_report(true, false, false, false);
+    assert!(warnings.iter().any(|w| w == "an image couldn't be decoded and is missing from the picture"), "{warnings:?}");
+    assert_eq!(paths, 1);
+}
+
+#[test]
+fn missing_plain_image_in_unclipped_mask_omits_masked_object() {
+    let (warnings, paths) = image_mask_report(false, false, false, false);
+    assert!(warnings.iter().any(|w| w == "an image couldn't be decoded and is missing from the picture"), "{warnings:?}");
+    assert_eq!(paths, 1);
+}
+
+#[test]
+fn missing_image_in_nested_mask_omits_outer_masked_object() {
+    let (warnings, paths) = image_mask_report(false, false, true, false);
+    assert!(warnings.iter().any(|w| w == "an image couldn't be decoded and is missing from the picture"), "{warnings:?}");
+    assert_eq!(paths, 1);
+}
+
+#[test]
+fn writable_colorized_image_in_unclipped_mask_keeps_masked_object() {
+    let (warnings, paths) = image_mask_report(true, true, false, false);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(paths, 2);
+}
+
+#[test]
+fn unwritable_images_in_unclipped_masks_omit_masked_objects() {
+    for colorized in [false, true] {
+        let (warnings, paths) = image_mask_report(colorized, true, false, true);
+        assert!(warnings.iter().any(|w| w == "an image couldn't be written and is missing from the picture"), "{warnings:?}");
+        assert_eq!(paths, 1, "colorized: {colorized}");
+    }
 }
 
 #[test]

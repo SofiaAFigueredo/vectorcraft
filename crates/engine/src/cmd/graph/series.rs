@@ -1,5 +1,8 @@
-use super::labels::{Role, label_style};
-use super::{CharStyle, Color, Document, GraphKind, GraphSpec, HashMap, Node, NodeId, NodeKind, Paint, Result, Session, Value, bad};
+use vectorcraft_color::BlendMode;
+
+use super::axis::radar_axis;
+use super::labels::{Role, filled_lines_on, label_para, label_style};
+use super::{Arc, CharStyle, Color, Document, GraphKind, GraphSpec, HashMap, Node, NodeId, NodeKind, Paint, Rect, Result, Session, Value, bad};
 
 // ---------- generation ----------
 
@@ -25,6 +28,48 @@ pub(super) fn series_marks(g: &GraphSpec, i: usize, series_fill: bool, stroke: P
     (fill, stroke, width)
 }
 
+/// The paths directly inside series `i`'s group (`items`) with the series' kept fill and stroke opacity and blend mode on
+/// their topmost fill and stroke, and its kept object opacity and blend mode. Other art, such as a graph design, keeps its
+/// own. An opacity read from a file is held to 0..1, and one that is not a number is left out.
+pub(super) fn with_series_opacity(g: &GraphSpec, i: usize, mut items: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
+    let Some(slot) = g.series_paints.get(i) else { return items };
+    let kept = |o: Option<f32>| o.filter(|o| o.is_finite()).map(|o| o.clamp(0.0, 1.0));
+    let (fill, stroke, object) = (kept(slot.fill_opacity), kept(slot.stroke_opacity), kept(slot.opacity));
+    if fill.is_none() && stroke.is_none() && object.is_none() && slot.fill_blend.is_none() && slot.stroke_blend.is_none() && slot.blend.is_none() {
+        return items;
+    }
+    for item in &mut items {
+        if !matches!(item.kind, NodeKind::Path { .. }) {
+            continue;
+        }
+        let n = Arc::make_mut(item);
+        if let Some(o) = object {
+            n.opacity = o;
+        }
+        if let Some(b) = slot.blend {
+            n.blend = b;
+        }
+        let ap = &mut n.appearance;
+        if let Some(f) = ap.fill_mut() {
+            if let Some(o) = fill {
+                f.opacity = o;
+            }
+            if let Some(b) = slot.fill_blend {
+                f.blend = b;
+            }
+        }
+        if let Some(st) = ap.stroke_mut() {
+            if let Some(o) = stroke {
+                st.opacity = o;
+            }
+            if let Some(b) = slot.stroke_blend {
+                st.blend = b;
+            }
+        }
+    }
+    items
+}
+
 /// Where a node inside a graph's generated series art belongs: the graph, the series group and
 /// the series index stored on that group.
 #[derive(Clone, Copy)]
@@ -34,6 +79,11 @@ struct SeriesRef {
     index: usize,
 }
 
+/// How many series groups `spec`'s graph has: a group whose index is past it (the index comes from the file) is not one.
+fn series_count(spec: &GraphSpec) -> usize {
+    spec.rows.iter().map(Vec::len).max().unwrap_or(0).clamp(1, vectorcraft_doc::MAX_GRAPH_SERIES)
+}
+
 /// Every node in a graph's series groups (the groups too), found in one pass over the document.
 /// Axes, the legend and groups whose index is past the graph's series (the index comes from the
 /// file) are left out.
@@ -41,7 +91,7 @@ fn series_members(doc: &Document) -> HashMap<NodeId, SeriesRef> {
     let mut out = HashMap::new();
     doc.walk(|n| {
         let Some(spec) = n.extras().graph.as_deref() else { return };
-        let count = spec.rows.iter().map(Vec::len).max().unwrap_or(0).clamp(1, vectorcraft_doc::MAX_GRAPH_SERIES);
+        let count = series_count(spec);
         for group in n.children().into_iter().flatten() {
             let Some(index) = group.extras().series_index.and_then(|i| usize::try_from(i).ok()).filter(|i| *i < count) else { continue };
             let r = SeriesRef { graph: n.id, group: group.id, index };
@@ -50,6 +100,25 @@ fn series_members(doc: &Document) -> HashMap<NodeId, SeriesRef> {
             });
         }
     });
+    out
+}
+
+/// The objects directly in a series group among `roots` and inside them, for an edit that reaches graph series marks
+/// without naming them. They may include objects of groups that only look like series groups; the capture functions
+/// check each one.
+pub(crate) fn series_marks_in(doc: &Document, roots: &[NodeId]) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    for id in roots {
+        if doc.parent_of(*id).and_then(|p| doc.node(p)).is_some_and(|g| g.extras().series_index.is_some()) {
+            out.push(*id);
+        }
+        let Some(root) = doc.node(*id) else { continue };
+        root.walk(&mut |n| {
+            if n.extras().series_index.is_some() {
+                out.extend(n.children().into_iter().flatten().map(|c| c.id));
+            }
+        });
+    }
     out
 }
 
@@ -62,7 +131,7 @@ pub(crate) fn paint_targets(doc: &Document, ids: &[NodeId]) -> Vec<NodeId> {
     }
     let mut out = Vec::new();
     for id in ids {
-        // The series' own marks: the art of a marker design inside it keeps the design's paint (painting it would
+        // The series' own marks: the art of a graph design inside it keeps the design's paint (painting it would
         // last only until the graph is drawn again), so edit the design to change it.
         match members.get(id) {
             Some(r) if r.group == *id => {
@@ -70,7 +139,7 @@ pub(crate) fn paint_targets(doc: &Document, ids: &[NodeId]) -> Vec<NodeId> {
                     out.extend(group.children().into_iter().flatten().filter(|m| matches!(m.kind, NodeKind::Path { .. })).map(|m| m.id));
                 }
             }
-            Some(r) if doc.parent_of(*id) != Some(r.group) => {}
+            Some(r) if doc.parent_of(*id) != Some(r.group) || doc.node(*id).is_some_and(|n| !matches!(n.kind, NodeKind::Path { .. })) => {}
             _ => out.push(*id),
         }
     }
@@ -79,44 +148,388 @@ pub(crate) fn paint_targets(doc: &Document, ids: &[NodeId]) -> Vec<NodeId> {
     out
 }
 
-/// Copy the paint just applied to generated series art into that series' fill or stroke. Called
-/// inside the same document edit, so the visible paint and future regeneration undo together.
-/// Gradients, patterns and swatch links are kept as [`Paint`], not reduced to a solid colour.
-/// Returns whether a series' captured fill or stroke changed.
-pub(crate) fn capture_series_paints(doc: &mut Document, ids: &[NodeId], fill: bool) -> bool {
+/// `ids` with each graph series group replaced by the paths directly inside it, as [`paint_targets`] reads a series
+/// group: the graph draws its series groups again with no rows of their own. A series group with no such path, other
+/// ids and the art of a graph design pass through, and the order of `ids` is kept.
+pub(crate) fn series_group_marks(doc: &Document, ids: &[NodeId]) -> Vec<NodeId> {
+    series_group_marks_where(doc, ids, |_| true)
+}
+
+/// [`series_group_marks`] for the series groups `stands` accepts; the others pass through.
+pub(crate) fn series_group_marks_where(doc: &Document, ids: &[NodeId], stands: impl Fn(&Node) -> bool) -> Vec<NodeId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for id in ids {
+        match doc.node(*id) {
+            Some(group) if is_series_group(doc, group) && stands(group) => {
+                let marks: Vec<NodeId> =
+                    group.children().into_iter().flatten().filter(|m| matches!(m.kind, NodeKind::Path { .. })).map(|m| m.id).collect();
+                if marks.is_empty() { out.push(*id) } else { out.extend(marks) }
+            }
+            _ => out.push(*id),
+        }
+    }
+    out.retain(|id| seen.insert(*id));
+    out
+}
+
+/// Whether `n` is a graph series group: a child of a graph with one of the graph's series indexes ([`series_members`]).
+/// It is looked up through its parent, with no pass over the document: the panels call this while they draw.
+fn is_series_group(doc: &Document, n: &Node) -> bool {
+    let Some(index) = n.extras().series_index.and_then(|i| usize::try_from(i).ok()) else { return false };
+    let graph = doc.parent_of(n.id).and_then(|parent| doc.node(parent)).and_then(|parent| parent.extras().graph.as_deref());
+    graph.is_some_and(|spec| index < series_count(spec))
+}
+
+/// Whether `id` is the art of a graph design drawn in a graph series (Object › Graph › Column or Marker): an object
+/// inside a series group other than a path directly in it. The graph draws that art again from the design.
+pub(crate) fn is_design_art(doc: &Document, id: NodeId) -> bool {
+    let Some(chain) = doc.ancestry(id) else { return false };
+    let Some(at) = chain.iter().position(|a| doc.node(*a).is_some_and(|n| is_series_group(doc, n))) else { return false };
+    match chain.len() - at {
+        1 => false,
+        2 => doc.node(id).is_some_and(|n| !matches!(n.kind, NodeKind::Path { .. })),
+        _ => true,
+    }
+}
+
+/// The paint of the topmost visible fill (`true`) or stroke (`false`) of `node`, and a stroke's weight (0 without paint).
+/// With no such row: no paint.
+pub(crate) fn shown_paint(node: &Node, fill: bool) -> (Paint, f64) {
+    match node.appearance.items.iter().rev().find(|it| it.is_fill() == fill && it.visible()) {
+        Some(vectorcraft_doc::AppearanceItem::Stroke(st)) if !st.paint.is_none() => (st.paint.clone(), st.width),
+        Some(it) => (it.paint().clone(), 0.0),
+        None => (Paint::None, 0.0),
+    }
+}
+
+/// Copy the paint of the topmost visible fill (`true`) or stroke (`false`), and a stroke's weight, of generated series
+/// art just edited (`edited`: each object with the kind of row, later entries replacing earlier ones) into that series'
+/// fill or stroke; art left without such a row keeps no paint. Gradients, patterns and swatch links are kept as
+/// [`Paint`], not reduced to a solid color. A series that draws Filled Lines bands stores no stroke: its
+/// bands keep their own outline. Called inside the same document edit, so both undo together. Returns whether a series'
+/// captured fill or stroke changed.
+pub(crate) fn capture_series_top_paints(doc: &mut Document, edited: &[(NodeId, bool)]) -> bool {
+    if edited.is_empty() {
+        return false;
+    }
     let members = series_members(doc);
     if members.is_empty() {
         return false;
     }
-    let captures: Vec<_> = ids
+    // Each series is checked once: the check reads the graph's whole grid.
+    let mut bands: HashMap<(NodeId, usize), bool> = HashMap::new();
+    let mut captures = Vec::new();
+    for (id, fill) in edited {
+        // Only the paths the graph draws again, not the copy of a graph design.
+        let Some(r) = members.get(id).filter(|r| doc.parent_of(*id) == Some(r.group)) else { continue };
+        let Some(node) = doc.node(*id).filter(|n| matches!(n.kind, NodeKind::Path { .. })) else { continue };
+        let drawn = || doc.node(r.graph).and_then(|n| n.extras().graph.as_deref()).is_some_and(|g| series_draws_bands(g, r.index));
+        if !*fill && *bands.entry((r.graph, r.index)).or_insert_with(drawn) {
+            continue;
+        }
+        let (paint, width) = shown_paint(node, *fill);
+        let width = (!*fill).then_some(width);
+        captures.push((r.graph, r.index, *fill, paint, width, paint_box(node, width)));
+    }
+    store_series_paints(doc, captures)
+}
+
+/// Does series `i` draw any Filled Lines band? A line needs two neighboring values, a scatter series two neighboring points
+/// in different places (its index counts pairs of columns), and a radar series two categories with a value plotted away
+/// from the center.
+fn series_draws_bands(g: &GraphSpec, i: usize) -> bool {
+    let series = g.rows.iter().map(Vec::len).max().unwrap_or(0).clamp(1, vectorcraft_doc::MAX_GRAPH_SERIES);
+    if !g.connect_points || !filled_lines_on(g, series) {
+        return false;
+    }
+    let cells = g.cells();
+    let cell = |row: &[Option<f64>], s: usize| row.get(s).copied().flatten();
+    match g.series_kind(i) {
+        GraphKind::Line => cells.windows(2).any(|w| w.iter().all(|row| cell(row, i).is_some())),
+        GraphKind::Radar => {
+            let (lo, hi, _) = radar_axis(g);
+            cells.len() > 1 && cells.iter().any(|row| (cell(row, i).unwrap_or(0.0) - lo) / (hi - lo) > 0.0)
+        }
+        GraphKind::Scatter => {
+            let s = i.saturating_mul(2);
+            let point = |row: &[Option<f64>]| Some((cell(row, s)?, cell(row, s.saturating_add(1))?));
+            cells.windows(2).any(|w| matches!(w, [a, b] if point(a).is_some() && point(b).is_some() && point(a) != point(b)))
+        }
+        _ => false,
+    }
+}
+
+/// Each graph's stored series paints before an edit's first capture into it. A later capture can put back what an earlier
+/// one changed, so an edit compares what it leaves with these ([`settle_series_paints`]).
+type SeriesPaintsBefore = HashMap<NodeId, Vec<vectorcraft_doc::SeriesPaint>>;
+
+/// What an edit gave the characters of graph label `id`, applied to a character style ([`capture_label_text`]).
+pub(crate) type LabelTextChange<'a> = &'a dyn Fn(NodeId, &mut CharStyle);
+
+/// Does any graph in `before` now store other series paints than it did before the edit's first capture? Slots the
+/// captures added past the old end and left empty are removed again, so they do not count as a change.
+fn settle_series_paints(doc: &mut Document, before: SeriesPaintsBefore) -> bool {
+    let mut changed = false;
+    for (graph, was) in before {
+        let Some(spec) = doc.node_mut(graph).and_then(|n| n.extras_if_any().and_then(|e| e.graph.as_deref_mut())) else { continue };
+        let empty = vectorcraft_doc::SeriesPaint::default();
+        if spec.series_paints.get(was.len()..).is_some_and(|added| added.iter().all(|slot| *slot == empty)) {
+            spec.series_paints.truncate(was.len());
+        }
+        changed |= spec.series_paints != was;
+    }
+    changed
+}
+
+/// The box a series keeps a gradient relative to: (0, 0)–(1, 1), as graphic styles keep theirs.
+const UNIT_BOX: Rect = vectorcraft_doc::GraphicStyle::UNIT_BOX;
+
+/// The gradient `slot` keeps for its fill (`fill`) or stroke as the graph draws it on box `on`: one kept relative to the
+/// unit box placed on `on`, also when `on` has no width or no height, and one kept in document coordinates as it is kept.
+/// None when the slot keeps no gradient, or keeps one relative to the unit box and there is no box.
+fn kept_on(slot: &vectorcraft_doc::SeriesPaint, fill: bool, on: Option<Rect>) -> Option<Paint> {
+    let (kept, unit) = if fill { (&slot.fill, slot.fill_unit_box) } else { (&slot.stroke, slot.stroke_unit_box) };
+    let Some(Paint::Gradient(g)) = kept else { return None };
+    if !unit {
+        return Some(Paint::Gradient(g.clone()));
+    }
+    let on = on?;
+    let mut g = g.clone();
+    g.rebase(UNIT_BOX, on);
+    Some(Paint::Gradient(g))
+}
+
+/// Whether `a` and `b` are the same paint, a gradient's vector, focal point and freeform points each within 1e-6 pt (the
+/// rounding a move or a placement on another box leaves).
+fn same_paint_placed(a: &Paint, b: &Paint) -> bool {
+    let (Paint::Gradient(a), Paint::Gradient(b)) = (a, b) else { return a == b };
+    let near = |p: vectorcraft_geom::Point, q: vectorcraft_geom::Point| (p - q).hypot() <= 1e-6;
+    let mut a = (**a).clone();
+    match (&mut a.geom, &b.geom) {
+        (Some(ag), Some(bg)) => {
+            let focal = match (ag.focal, bg.focal) {
+                (Some(p), Some(q)) => near(p, q),
+                (p, q) => p.is_none() && q.is_none(),
+            };
+            if !(near(ag.start, bg.start) && near(ag.end, bg.end) && focal) {
+                return false;
+            }
+            (ag.start, ag.end, ag.focal) = (bg.start, bg.end, bg.focal);
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    match (&mut a.freeform, &b.freeform) {
+        (Some(af), Some(bf)) => {
+            if af.points.len() != bf.points.len() || !af.points.iter().zip(&bf.points).all(|(p, q)| near(p.at, q.at)) {
+                return false;
+            }
+            for (p, q) in af.points.iter_mut().zip(&bf.points) {
+                p.at = q.at;
+            }
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    a == **b
+}
+
+/// The box a gradient on `node`'s fill (`width` None) or on its stroke of `width` is placed on: the geometric bounds, grown
+/// by half the weight for a stroke. The box can have no width or no height.
+fn paint_box(node: &Node, width: Option<f64>) -> Option<Rect> {
+    let b = node.geometric_bounds()?;
+    Some(width.map_or(b, |w| vectorcraft_doc::appearance::stroke_paint_bounds(b, w)))
+}
+
+/// `paint` as a series keeps it: a gradient placed on `from` (the edited mark's [`paint_box`]) is moved to the same place
+/// relative to [`UNIT_BOX`], so each mark takes it on its own box. A box with no width or no height, which a gradient's
+/// place cannot be kept relative to, leaves the paint in document coordinates. Returns the paint and whether it was moved.
+fn unit_box_paint(paint: Paint, from: Option<Rect>) -> (Paint, bool) {
+    match (paint, from.filter(|b| b.width() > 1e-9 && b.height() > 1e-9)) {
+        (Paint::Gradient(mut g), Some(from)) => {
+            g.rebase(from, UNIT_BOX);
+            (Paint::Gradient(g), true)
+        }
+        (paint, _) => (paint, false),
+    }
+}
+
+/// The paths directly inside series `i`'s group (`items`) with the series' kept gradients, which are kept relative to the
+/// unit box, placed on each path's own box: a fill on its geometric bounds, a stroke on its stroke's box. Paints kept in
+/// document coordinates (from files saved before the unit box) are left as they are.
+pub(super) fn with_series_gradients(g: &GraphSpec, i: usize, mut items: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
+    let Some(slot) = g.series_paints.get(i) else { return items };
+    fn kept(p: &Option<Paint>, unit: bool) -> Option<&Paint> {
+        p.as_ref().filter(|p| unit && matches!(p, Paint::Gradient(_)))
+    }
+    let (fill, stroke) = (kept(&slot.fill, slot.fill_unit_box), kept(&slot.stroke, slot.stroke_unit_box));
+    if fill.is_none() && stroke.is_none() {
+        return items;
+    }
+    // A Filled Lines band takes the kept stroke as its fill when no fill is kept.
+    let band_fill = if slot.fill.is_none() { stroke } else { None };
+    let fill_from_store = |p: &Paint| fill == Some(p) || band_fill == Some(p);
+    let stroke_from_store = |p: &Paint| stroke == Some(p);
+    for item in &mut items {
+        if !matches!(item.kind, NodeKind::Path { .. }) {
+            continue;
+        }
+        let Some(b) = item.geometric_bounds() else { continue };
+        let ap = &item.appearance;
+        if !ap.fill().is_some_and(|f| fill_from_store(&f.paint)) && !ap.stroke().is_some_and(|st| stroke_from_store(&st.paint)) {
+            continue;
+        }
+        let ap = &mut Arc::make_mut(item).appearance;
+        if let Some(f) = ap.fill_mut().filter(|f| fill_from_store(&f.paint))
+            && let Paint::Gradient(gp) = &mut f.paint
+        {
+            gp.rebase(UNIT_BOX, b);
+        }
+        if let Some(st) = ap.stroke_mut().filter(|st| stroke_from_store(&st.paint)) {
+            let to = st.paint_bounds(b);
+            if let Paint::Gradient(gp) = &mut st.paint {
+                gp.rebase(UNIT_BOX, to);
+            }
+        }
+    }
+    items
+}
+
+/// A paint taken from a series mark: graph, series index, fill or stroke, paint, stroke weight and the mark's
+/// [`paint_box`].
+type Capture = (NodeId, usize, bool, Paint, Option<f64>, Option<Rect>);
+
+/// Store each capture in its series; a gradient is kept relative to the unit box ([`unit_box_paint`]). Returns whether a
+/// series' captured fill or stroke differs from what the graph stored before the first capture.
+fn store_series_paints(doc: &mut Document, captures: Vec<Capture>) -> bool {
+    let mut before = SeriesPaintsBefore::new();
+    for (graph, index, fill, paint, width, from) in captures {
+        let Some(spec) = doc.node_mut(graph).and_then(|n| n.extras_if_any().and_then(|e| e.graph.as_deref_mut())) else { continue };
+        before.entry(graph).or_insert_with(|| spec.series_paints.clone());
+        // `index` is below the graph's series count (`series_members`).
+        if spec.series_paints.len() <= index {
+            spec.series_paints.resize(index + 1, vectorcraft_doc::SeriesPaint::default());
+        }
+        let Some(slot) = spec.series_paints.get_mut(index) else { continue };
+        // A mark that shows the kept gradient as it was drawn leaves the kept gradient as it is.
+        let drawn = kept_on(slot, fill, from).is_some_and(|kept| same_paint_placed(&kept, &paint));
+        let (paint, unit) = unit_box_paint(paint, from);
+        if fill {
+            if !drawn {
+                (slot.fill, slot.fill_unit_box) = (Some(paint), unit);
+            }
+        } else {
+            if !drawn {
+                (slot.stroke, slot.stroke_unit_box) = (Some(paint), unit);
+            }
+            slot.stroke_width = width;
+        }
+    }
+    settle_series_paints(doc, before)
+}
+
+/// Copy the opacity and blend mode of the topmost visible fill (`true`) or stroke (`false`) of generated series art just
+/// edited (`edited`: each object with the kind of row) into that series' fill or stroke opacity and blend mode; art left
+/// without a row of that kind keeps neither. Called inside the same document edit, so both undo together. Returns
+/// whether a series' kept opacity or blend mode changed.
+pub(crate) fn capture_series_opacity(doc: &mut Document, edited: &[(NodeId, bool)]) -> bool {
+    if edited.is_empty() {
+        return false;
+    }
+    let members = series_members(doc);
+    if members.is_empty() {
+        return false;
+    }
+    let captures: Vec<_> = edited
         .iter()
-        .filter_map(|id| {
-            // Only a series' own marks set its paint, not the art of a marker design.
+        .filter_map(|(id, fill)| {
+            // Only the paths the graph draws again, not the copy of a graph design.
             let r = members.get(id).filter(|r| doc.parent_of(*id) == Some(r.group))?;
-            let node = doc.node(*id)?;
-            let paint = node.appearance.paint_at(None, fill)?.clone();
-            let width = (!fill).then(|| node.appearance.stroke_width());
-            Some((r.graph, r.index, paint, width))
+            let node = doc.node(*id).filter(|n| matches!(n.kind, NodeKind::Path { .. }))?;
+            let row = node.appearance.items.iter().rev().find(|it| it.is_fill() == *fill && it.visible());
+            let opacity = row.map_or(1.0, vectorcraft_doc::AppearanceItem::opacity);
+            let blend = row.map_or(BlendMode::Normal, vectorcraft_doc::AppearanceItem::blend);
+            Some((r.graph, r.index, *fill, (opacity < 1.0).then_some(opacity), (blend != BlendMode::Normal).then_some(blend)))
         })
         .collect();
-    let mut changed = false;
-    for (graph, index, paint, width) in captures {
+    let mut before = SeriesPaintsBefore::new();
+    for (graph, index, fill, kept, blend) in captures {
         let Some(spec) = doc.node_mut(graph).and_then(|n| n.extras_if_any().and_then(|e| e.graph.as_deref_mut())) else { continue };
-        let was = spec.series_paints.clone();
+        // A fully opaque Normal row on a series the graph keeps nothing for leaves the graph as it is.
+        if kept.is_none() && blend.is_none() && spec.series_paints.len() <= index {
+            continue;
+        }
+        before.entry(graph).or_insert_with(|| spec.series_paints.clone());
         // `index` is below the graph's series count (`series_members`).
         if spec.series_paints.len() <= index {
             spec.series_paints.resize(index + 1, vectorcraft_doc::SeriesPaint::default());
         }
         let Some(slot) = spec.series_paints.get_mut(index) else { continue };
         if fill {
-            slot.fill = Some(paint);
+            (slot.fill_opacity, slot.fill_blend) = (kept, blend);
         } else {
-            slot.stroke = Some(paint);
-            slot.stroke_width = width;
+            (slot.stroke_opacity, slot.stroke_blend) = (kept, blend);
         }
-        changed |= spec.series_paints != was;
     }
-    changed
+    settle_series_paints(doc, before)
+}
+
+/// Copy the object opacity and blend mode of generated series art just edited (`edited`) into that series' object opacity
+/// and blend mode. Called inside the same document edit, so both undo together. Returns whether a series' kept object
+/// opacity or blend mode changed.
+pub(crate) fn capture_series_object_opacity(doc: &mut Document, edited: &[NodeId]) -> bool {
+    let mut before = SeriesPaintsBefore::new();
+    for (graph, index, opacity, blend) in object_opacity_captures(doc, edited) {
+        let Some(spec) = doc.node_mut(graph).and_then(|n| n.extras_if_any().and_then(|e| e.graph.as_deref_mut())) else { continue };
+        // A fully opaque Normal object on a series the graph keeps nothing for leaves the graph as it is.
+        if opacity.is_none() && blend.is_none() && spec.series_paints.len() <= index {
+            continue;
+        }
+        before.entry(graph).or_insert_with(|| spec.series_paints.clone());
+        // `index` is below the graph's series count (`series_members`).
+        if spec.series_paints.len() <= index {
+            spec.series_paints.resize(index + 1, vectorcraft_doc::SeriesPaint::default());
+        }
+        let Some(slot) = spec.series_paints.get_mut(index) else { continue };
+        (slot.opacity, slot.blend) = (opacity, blend);
+    }
+    settle_series_paints(doc, before)
+}
+
+/// Would [`capture_series_object_opacity`] change what the graph stores for `edited`? Reads the document without copying
+/// it.
+pub(crate) fn series_object_opacity_differs(doc: &Document, edited: &[NodeId]) -> bool {
+    let mut after: HashMap<(NodeId, usize), (Option<f32>, Option<BlendMode>)> = HashMap::new();
+    let stored = |graph: NodeId, index: usize| {
+        let spec = doc.node(graph).and_then(|n| n.extras().graph.as_deref());
+        spec.and_then(|g| g.series_paints.get(index)).map_or((None, None), |slot| (slot.opacity, slot.blend))
+    };
+    for (graph, index, opacity, blend) in object_opacity_captures(doc, edited) {
+        after.insert((graph, index), (opacity, blend));
+    }
+    after.into_iter().any(|((graph, index), pair)| stored(graph, index) != pair)
+}
+
+/// The series and object opacity and blend mode (None for 100% and Normal) of each of `edited` that is a path directly in a
+/// series group, in order.
+fn object_opacity_captures(doc: &Document, edited: &[NodeId]) -> Vec<(NodeId, usize, Option<f32>, Option<BlendMode>)> {
+    if edited.is_empty() {
+        return Vec::new();
+    }
+    let members = series_members(doc);
+    if members.is_empty() {
+        return Vec::new();
+    }
+    edited
+        .iter()
+        .filter_map(|id| {
+            // Only the paths the graph draws again, not the copy of a graph design.
+            let r = members.get(id).filter(|r| doc.parent_of(*id) == Some(r.group))?;
+            let node = doc.node(*id).filter(|n| matches!(n.kind, NodeKind::Path { .. }))?;
+            Some((r.graph, r.index, (node.opacity < 1.0).then_some(node.opacity), (node.blend != BlendMode::Normal).then_some(node.blend)))
+        })
+        .collect()
 }
 
 /// Graph Data › Transpose row/column: categories become series and series categories.
@@ -185,35 +598,381 @@ fn graph_labels(doc: &Document) -> HashMap<NodeId, (NodeId, Role)> {
     out
 }
 
-/// Keep a formatting change made to graph labels `ids` (Character or Appearance, on the whole graph or on labels
-/// picked with Group Selection) for every label of their kind: `change` is applied to the kind's kept style (or
-/// the default one), so the labels look the same when the graph is drawn again. Called inside the same edit, so
-/// they undo together. Returns whether a kept style changed.
-pub(crate) fn capture_label_styles(doc: &mut Document, ids: &[NodeId], change: &dyn Fn(&mut CharStyle)) -> bool {
-    if ids.is_empty() {
-        return false;
-    }
+/// Keep the anti-aliasing method `method` given to graph labels `ids` for every label of their kind, as
+/// [`capture_label_styles`] keeps a formatting change. Returns whether a kept method changed.
+pub(crate) fn capture_label_anti_alias(doc: &mut Document, ids: &[NodeId], method: vectorcraft_doc::text::TypeAntiAlias) -> bool {
     let labels = graph_labels(doc);
-    if labels.is_empty() {
-        return false;
-    }
     let mut kinds: Vec<(NodeId, Role)> = ids.iter().filter_map(|id| labels.get(id).copied()).collect();
     kinds.sort_by_key(|(g, r)| (g.0, *r as u8));
     kinds.dedup();
     let mut changed = false;
     for (graph, role) in kinds {
         let Some(spec) = doc.node_mut(graph).and_then(|n| n.extras_if_any().and_then(|e| e.graph.as_deref_mut())) else { continue };
-        let mut style = label_style(&spec.label_styles, role);
-        change(&mut style);
         let slot = match role {
-            Role::Value => &mut spec.label_styles.values,
-            Role::Category => &mut spec.label_styles.categories,
-            Role::Legend => &mut spec.label_styles.legend,
+            Role::Value => &mut spec.label_styles.values_anti_alias,
+            Role::Category => &mut spec.label_styles.categories_anti_alias,
+            Role::Legend => &mut spec.label_styles.legend_anti_alias,
         };
-        changed |= slot.as_ref() != Some(&style);
-        *slot = Some(style);
+        changed |= *slot != Some(method);
+        *slot = Some(method);
     }
     changed
+}
+
+/// Keep a formatting change made to graph labels `ids` (Character or Appearance, on the whole graph or on labels
+/// picked with Group Selection) for every label of their kind: `change` is applied to the kind's kept style (or
+/// the default one), so the labels look the same when the graph is drawn again. Called inside the same edit, so
+/// they undo together. Returns whether a kept style changed.
+pub(crate) fn capture_label_styles(doc: &mut Document, ids: &[NodeId], change: &dyn Fn(&mut CharStyle)) -> bool {
+    let mut changed = false;
+    for (graph, role) in label_kinds(doc, ids) {
+        changed |= store_label_style(doc, graph, role, change);
+    }
+    changed
+}
+
+/// Apply `change` to the style graph `graph` keeps for its labels of kind `role` (or the default one). A `change` that
+/// sets the fill of legend labels marks it as set on them, so a black one stays black on dark pie wedges. Returns whether
+/// the kept style or that mark changed.
+fn store_label_style(doc: &mut Document, graph: NodeId, role: Role, change: &dyn Fn(&mut CharStyle)) -> bool {
+    let Some(spec) = doc.node_mut(graph).and_then(|n| n.extras_if_any().and_then(|e| e.graph.as_deref_mut())) else { return false };
+    let mut style = label_style(&spec.label_styles, role);
+    // The kept fill can already be the one `change` sets (black, the default): `change` sets the fill when it gives one
+    // of two different fills something else.
+    let sets_fill = role == Role::Legend
+        && [Paint::None, Paint::solid(Color::BLACK)].into_iter().any(|fill| {
+            let mut probe = CharStyle { fill: fill.clone(), ..style.clone() };
+            change(&mut probe);
+            probe.fill != fill
+        });
+    change(&mut style);
+    let styles = &mut spec.label_styles;
+    let slot = match role {
+        Role::Value => &mut styles.values,
+        Role::Category => &mut styles.categories,
+        Role::Legend => &mut styles.legend,
+    };
+    let mut changed = slot.as_ref() != Some(&style);
+    *slot = Some(style);
+    if sets_fill && !styles.legend_fill_set {
+        styles.legend_fill_set = true;
+        changed = true;
+    }
+    changed
+}
+
+/// Keep a paragraph change made to all of the text of graph labels `ids` (Paragraph, on the whole graph or on labels
+/// picked with Group Selection) for every label of their kind, as [`capture_label_styles`] does for character
+/// formats. Returns whether kept attributes changed, or the error `change` returns for the kept attributes.
+pub(crate) fn capture_label_paragraphs(
+    doc: &mut Document,
+    ids: &[NodeId],
+    change: &dyn Fn(&mut vectorcraft_doc::ParaStyle) -> Result<()>,
+) -> Result<bool> {
+    let mut changed = false;
+    for (graph, role) in label_kinds(doc, ids) {
+        let Some(spec) = doc.node_mut(graph).and_then(|n| n.extras_if_any().and_then(|e| e.graph.as_deref_mut())) else { continue };
+        let mut para = label_para(&spec.label_styles, role);
+        change(&mut para)?;
+        let slot = match role {
+            Role::Value => &mut spec.label_styles.values_para,
+            Role::Category => &mut spec.label_styles.categories_para,
+            Role::Legend => &mut spec.label_styles.legend_para,
+        };
+        changed |= slot.as_ref() != Some(&para);
+        *slot = Some(para);
+    }
+    Ok(changed)
+}
+
+/// The object rows graph label `n` shows ([`vectorcraft_doc::LabelRows`]): the paint, weight, opacity and blend mode of
+/// its topmost visible fill and stroke row, its object opacity and blend mode, and where those rows paint. A placed
+/// gradient is kept without its placement, so it fits each label it lands on. `None`: no visible row, opaque and Normal.
+pub(crate) fn label_rows(n: &Node) -> Option<vectorcraft_doc::LabelRows> {
+    use vectorcraft_doc::AppearanceItem;
+    let items = &n.appearance.items;
+    let top = |fill: bool| items.iter().rposition(|it| it.is_fill() == fill && it.visible());
+    let opacity = |o: f32| (o != 1.0).then_some(o);
+    let blend = |b: BlendMode| (b != BlendMode::Normal).then_some(b);
+    let unplaced = crate::cmd::gradient::unplaced;
+    let mut rows = vectorcraft_doc::SeriesPaint { opacity: opacity(n.opacity), blend: blend(n.blend), ..Default::default() };
+    let (fill, stroke) = (top(true), top(false));
+    if let Some(f) = fill.and_then(|i| items.get(i)) {
+        (rows.fill, rows.fill_opacity, rows.fill_blend) = (Some(unplaced(f.paint())), opacity(f.opacity()), blend(f.blend()));
+    }
+    if let Some(AppearanceItem::Stroke(st)) = stroke.and_then(|i| items.get(i)) {
+        (rows.stroke, rows.stroke_width, rows.stroke_opacity, rows.stroke_blend) =
+            (Some(unplaced(&st.paint)), Some(st.width), opacity(st.opacity), blend(st.blend));
+    }
+    let contents = n.appearance.contents_at();
+    let below = [fill, stroke].into_iter().flatten().filter(|i| *i < contents).fold(0u8, |k, _| k + 1);
+    let rows = vectorcraft_doc::LabelRows {
+        paint: rows,
+        below: (below > 0).then_some(below),
+        stroke_under: matches!((fill, stroke), (Some(f), Some(s)) if s < f),
+    };
+    (rows != vectorcraft_doc::LabelRows::default()).then_some(rows)
+}
+
+/// Keep the object rows ([`label_rows`]) of graph labels `ids` for every label of their kind, as
+/// [`capture_label_styles`] keeps a character format, even when a label already showed them: the last label of a kind
+/// in the order of `ids` sets what that kind keeps. Objects other than type are left out before the graph's labels are
+/// looked up. Called inside the same edit, so they undo together. Returns whether kept rows changed.
+pub(crate) fn capture_label_rows(doc: &mut Document, ids: &[NodeId]) -> bool {
+    store_label_rows(doc, ids, false)
+}
+
+/// Keep the object opacity and blend mode of graph labels `ids` for every label of their kind, as [`capture_label_rows`]
+/// keeps them, and leave the kept fill and stroke rows as they are. Returns whether what the graph keeps changed.
+pub(crate) fn capture_label_object_opacity(doc: &mut Document, ids: &[NodeId]) -> bool {
+    store_label_rows(doc, ids, true)
+}
+
+/// Would [`capture_label_object_opacity`] change what a graph keeps for labels `ids`? Reads the document without copying
+/// it.
+pub(crate) fn label_object_opacity_differs(doc: &Document, ids: &[NodeId]) -> bool {
+    label_rows_of(doc, ids).into_iter().any(|(graph, role, rows)| {
+        let Some(spec) = doc.node(graph).and_then(|n| n.extras().graph.as_deref()) else { return false };
+        let slot = match role {
+            Role::Value => &spec.label_styles.values_rows,
+            Role::Category => &spec.label_styles.categories_rows,
+            Role::Legend => &spec.label_styles.legend_rows,
+        };
+        *slot != kept_label_rows(slot, rows, true)
+    })
+}
+
+/// [`capture_label_rows`], or with `object_only` [`capture_label_object_opacity`].
+fn store_label_rows(doc: &mut Document, ids: &[NodeId], object_only: bool) -> bool {
+    let mut changed = false;
+    for (graph, role, rows) in label_rows_of(doc, ids) {
+        let Some(spec) = doc.node_mut(graph).and_then(|n| n.extras_if_any().and_then(|e| e.graph.as_deref_mut())) else { continue };
+        let slot = match role {
+            Role::Value => &mut spec.label_styles.values_rows,
+            Role::Category => &mut spec.label_styles.categories_rows,
+            Role::Legend => &mut spec.label_styles.legend_rows,
+        };
+        let kept = kept_label_rows(slot, rows, object_only);
+        changed |= *slot != kept;
+        *slot = kept;
+    }
+    changed
+}
+
+/// What a kind keeps after a label of it shows `rows`: those rows, or with `object_only` what `slot` keeps with the
+/// label's object opacity and blend mode.
+fn kept_label_rows(
+    slot: &Option<vectorcraft_doc::LabelRows>,
+    rows: Option<vectorcraft_doc::LabelRows>,
+    object_only: bool,
+) -> Option<vectorcraft_doc::LabelRows> {
+    if !object_only {
+        return rows;
+    }
+    let mut kept = slot.clone().unwrap_or_default();
+    let shown = rows.unwrap_or_default();
+    (kept.paint.opacity, kept.paint.blend) = (shown.paint.opacity, shown.paint.blend);
+    (kept != vectorcraft_doc::LabelRows::default()).then_some(kept)
+}
+
+/// The graph, kind and rows ([`label_rows`]) of the last label of each kind among `ids`.
+fn label_rows_of(doc: &Document, ids: &[NodeId]) -> Vec<(NodeId, Role, Option<vectorcraft_doc::LabelRows>)> {
+    // Graph labels are type: without type among `ids`, the graph's labels are not looked up.
+    if !ids.iter().any(|id| doc.node(*id).is_some_and(|n| matches!(n.kind, NodeKind::Text(_)))) {
+        return vec![];
+    }
+    let labels = graph_labels(doc);
+    let mut picked: Vec<(NodeId, Role, Option<vectorcraft_doc::LabelRows>)> = vec![];
+    for (&(g, role), n) in ids.iter().rev().filter_map(|id| Some((labels.get(id)?, doc.node(*id)?))) {
+        if !picked.iter().any(|(pg, pr, _)| *pg == g && *pr == role) {
+            picked.push((g, role, label_rows(n)));
+        }
+    }
+    picked
+}
+
+/// Keep what an edit gave all of the text of graph labels `ids` for every label of their kind: `change`, when given (the
+/// character attributes the edit applied to label `id`), on the kind's kept style, as [`capture_label_styles`] keeps a
+/// character format, and `para`, when given, as the kind's paragraph attributes ([`capture_label_paragraphs`]).
+/// Attributes the edit did not apply stay as the kind keeps them. Returns whether a kept style or set of attributes
+/// changed.
+pub(crate) fn capture_label_text(
+    doc: &mut Document,
+    ids: &[NodeId],
+    change: Option<LabelTextChange>,
+    para: Option<&vectorcraft_doc::ParaStyle>,
+) -> Result<bool> {
+    if (change.is_none() && para.is_none()) || !ids.iter().any(|id| doc.node(*id).is_some_and(|n| matches!(n.kind, NodeKind::Text(_)))) {
+        return Ok(false);
+    }
+    // The last label of each kind sets what the kind keeps.
+    let labels = graph_labels(doc);
+    let mut last: Vec<((NodeId, Role), NodeId)> = vec![];
+    for id in ids.iter().rev() {
+        if let Some(kind) = labels.get(id).filter(|k| !last.iter().any(|(l, _)| l == *k)) {
+            last.push((*kind, *id));
+        }
+    }
+    let mut changed = false;
+    for id in last.iter().rev().map(|(_, id)| id) {
+        if let Some(change) = change {
+            changed |= capture_label_styles(doc, &[*id], &|st| change(*id, st));
+        }
+        if let Some(para) = para {
+            changed |= capture_label_paragraphs(doc, &[*id], &|p| {
+                *p = para.clone();
+                Ok(())
+            })?;
+        }
+    }
+    Ok(changed)
+}
+
+/// The character fill and stroke attributes a kind of graph label keeps when a recolor, or a stroke or gradient edit
+/// aimed at the characters, changes them on its labels ([`capture_label_changes`]). Each entry copies one attribute
+/// from the first style to the second and returns whether they differed.
+const RUN_PAINT: [fn(&CharStyle, &mut CharStyle) -> bool; 8] = [
+    |a, b| keep(&a.fill, &mut b.fill),
+    |a, b| keep(&a.stroke, &mut b.stroke),
+    |a, b| keep(&a.stroke_width, &mut b.stroke_width),
+    |a, b| keep(&a.stroke_cap, &mut b.stroke_cap),
+    |a, b| keep(&a.stroke_join, &mut b.stroke_join),
+    |a, b| keep(&a.stroke_miter_limit, &mut b.stroke_miter_limit),
+    |a, b| keep(&a.stroke_dash, &mut b.stroke_dash),
+    |a, b| keep(&a.stroke_align, &mut b.stroke_align),
+];
+
+/// Copy `from` to `to`. Returns whether they differed.
+fn keep<T: Clone + PartialEq>(from: &T, to: &mut T) -> bool {
+    let differs = from != to;
+    if differs {
+        to.clone_from(from);
+    }
+    differs
+}
+
+/// The [`RUN_PAINT`] attributes an edit changed on the characters of graph label `now` (`was`: the label before the
+/// edit), as the label's style and the indexes of the changed entries. An attribute counts only when every character
+/// of the label shows it alike, and the fill only when `fill` is set. A placed gradient is kept without its placement,
+/// so it fits each label it lands on. The stroke weight and dashes are kept as the label shows them: the graph draws its
+/// labels again without the label's own scale.
+fn run_paint_change(was: &Node, now: &Node, fill: bool) -> Option<(CharStyle, Vec<usize>)> {
+    let (NodeKind::Text(was), NodeKind::Text(now)) = (&was.kind, &now.kind) else { return None };
+    let first_now = &now.runs.first()?.style;
+    // Changed: some character showed something else before the edit, whichever run it is in.
+    let changed: Vec<usize> = RUN_PAINT
+        .iter()
+        .enumerate()
+        .filter(|(i, copy)| {
+            (fill || *i != 0)
+                && now.runs.iter().all(|r| !copy(first_now, &mut r.style.clone()))
+                && was.runs.iter().any(|r| copy(first_now, &mut r.style.clone()))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    let unplaced = crate::cmd::gradient::unplaced;
+    let mut style = first_now.clone();
+    (style.fill, style.stroke) = (unplaced(&style.fill), unplaced(&style.stroke));
+    // Character strokes are drawn in text space, scaled by the type's transform.
+    if let Some(k) = vectorcraft_doc::Scaling::factor(now.xf).filter(|k| k.is_finite() && *k > 1e-12) {
+        let mut st = style.stroke_layer();
+        crate::inspect::scale_layer(&mut st, k);
+        style.set_stroke_layer(&st);
+    }
+    Some((style, changed))
+}
+
+/// Does graph `g` pick the fill of its legend labels itself, white on a dark wedge and black on the others: a pie with
+/// Legends in Wedges whose legend labels keep no fill of their own ([`GraphSpec::picks_legend_fill`])?
+pub(super) fn picks_legend_fill(g: &GraphSpec) -> bool {
+    g.picks_legend_fill()
+}
+
+/// The graph labels among `roots` and inside them, for an edit that reaches graph labels without naming them.
+pub(crate) fn labels_in(doc: &Document, roots: &[NodeId]) -> Vec<NodeId> {
+    let mut texts = Vec::new();
+    for id in roots {
+        let Some(root) = doc.node(*id) else { continue };
+        root.walk(&mut |n| {
+            if matches!(n.kind, NodeKind::Text(_)) {
+                texts.push(n.id);
+            }
+        });
+    }
+    // Graph labels are type: without type among `roots`, the graph's labels are not looked up.
+    if texts.is_empty() {
+        return texts;
+    }
+    let labels = graph_labels(doc);
+    texts.retain(|id| labels.contains_key(id));
+    // Nested roots (a graph and one of its labels) reach a label twice.
+    texts.sort_unstable();
+    texts.dedup();
+    texts
+}
+
+/// Keep for every label of their kind what an edit changed on graph labels `ids` (`before`: the document before the
+/// edit): with `rows`, the object rows ([`capture_label_rows`]) of the labels whose rows changed, and the character fill
+/// and stroke attributes ([`RUN_PAINT`]) that changed on all of a label's characters, on the kind's kept style. The
+/// frontmost label of a kind sets what that kind keeps, whatever order `ids` are in. On a graph that colors its legend
+/// labels itself ([`picks_legend_fill`]), their fill is kept only when the legend labels among `ids` end up with one
+/// fill. Called inside the same edit, so they undo together. Returns whether what a graph keeps changed.
+pub(crate) fn capture_label_changes(before: &Document, doc: &mut Document, ids: &[NodeId], rows: bool) -> bool {
+    if !ids.iter().any(|id| doc.node(*id).is_some_and(|n| matches!(n.kind, NodeKind::Text(_)))) {
+        return false;
+    }
+    let labels = graph_labels(doc);
+    let mut picked: Vec<NodeId> = ids.iter().copied().filter(|id| labels.contains_key(id)).collect();
+    // A later label's capture replaces an earlier one's: take them in paint order, each once.
+    picked.sort_by_cached_key(|id| doc.index_path(*id));
+    picked.dedup();
+    let picks_fill = |graph: NodeId| doc.node(graph).and_then(|n| n.extras().graph.as_deref()).is_some_and(picks_legend_fill);
+    // On a pie that colors its legend labels black or white by their wedge, a recolor of the whole pie flips them both
+    // ways: their fill is kept only when every legend label the edit reached ends up with the same one.
+    let mut wedge_fills: HashMap<NodeId, Vec<Paint>> = HashMap::new();
+    for id in &picked {
+        let (Some(&(graph, Role::Legend)), Some(NodeKind::Text(t))) = (labels.get(id), doc.node(*id).map(|n| &n.kind)) else { continue };
+        if picks_fill(graph) {
+            wedge_fills.entry(graph).or_default().extend(t.runs.iter().map(|r| r.style.fill.clone()));
+        }
+    }
+    let one_fill = |graph: NodeId| wedge_fills.get(&graph).is_none_or(|f| f.windows(2).all(|w| w[0] == w[1]));
+    let mut changed_rows = Vec::new();
+    let mut characters = Vec::new();
+    for (id, kind) in picked.iter().filter_map(|id| Some((*id, *labels.get(id)?))) {
+        let (Some(was), Some(now)) = (before.node(id), doc.node(id)) else { continue };
+        if rows && label_rows(was) != label_rows(now) {
+            changed_rows.push(id);
+        }
+        let fill = kind.1 != Role::Legend || one_fill(kind.0);
+        characters.extend(run_paint_change(was, now, fill).map(|change| (kind, change)));
+    }
+    let mut changed = capture_label_rows(doc, &changed_rows);
+    for ((graph, role), (style, entries)) in &characters {
+        changed |= store_label_style(doc, *graph, *role, &|st| {
+            for i in entries {
+                if let Some(copy) = RUN_PAINT.get(*i) {
+                    copy(style, st);
+                }
+            }
+        });
+    }
+    changed
+}
+
+/// The graphs and kinds of label among `ids`, each once.
+fn label_kinds(doc: &Document, ids: &[NodeId]) -> Vec<(NodeId, Role)> {
+    if ids.is_empty() {
+        return vec![];
+    }
+    let labels = graph_labels(doc);
+    let mut kinds: Vec<(NodeId, Role)> = ids.iter().filter_map(|id| labels.get(id).copied()).collect();
+    kinds.sort_by_key(|(g, r)| (g.0, *r as u8));
+    kinds.dedup();
+    kinds
 }
 
 /// The series a command on graph `id` (of `count` series) applies to: `seriesIndexes`, else, with no `id` param, a
