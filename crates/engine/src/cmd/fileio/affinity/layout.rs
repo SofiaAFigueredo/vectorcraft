@@ -1,5 +1,5 @@
 use super::nodes::MAX_DEPTH;
-use super::*;
+use super::{AfAlign, CharStyle, Cursor, Justify, Kind, Rect, TextKind, TextObject, VerticalAlign, af, shapes};
 
 /// The master page instances among `nodes` (also inside layers and groups): (master, first page,
 /// first master page, page count).
@@ -157,7 +157,8 @@ pub(super) fn align_lines(obj: &mut TextObject) {
         return;
     }
     let lines = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), obj).lines;
-    let w = lines.iter().map(|l| l.x1 - l.x0).filter(|w| w.is_finite()).fold(0.0, f64::max);
+    // Each line as wide as VectorCraft aligns it: without the tracking after its last character.
+    let w = lines.iter().map(|l| l.x1 - l.trailing - l.x0).filter(|w| w.is_finite()).fold(0.0, f64::max);
     if !(w > 0.0 && w < 1e6) {
         return;
     }

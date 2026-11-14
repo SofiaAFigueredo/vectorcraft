@@ -1,6 +1,6 @@
 use super::slots::{PERSPECTIVE_SLOTS, RECENT_FONT_IDS, RECENT_IDS, SAVED_SELECTION_IDS, SAVED_VIEW_IDS};
 use super::submenus::{INSERT_BREAK, INSERT_SPECIAL, INSERT_WHITESPACE, PATH_EFFECTS, TYPE_SIZES, effect_menu, font_items, insert_items};
-use super::*;
+use super::{Item, Sep, c, cp, json, sub, todos};
 
 /// The in-window and native menu tree. The in-window bar skips the VectorCraft menu (see
 /// `menu_bar`); the native Mac bar is composed from the whole tree (see `native_menu`).
@@ -28,6 +28,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 c("New…", "file.newDialog"),
                 c("New from Template…", "file.newFromTemplate"),
                 c("Open…", "file.open"),
+                sub("Open With", crate::dialogs::plugin::open_with_menu()),
                 sub("Open Recent Files", {
                     let mut v: Vec<Item> = RECENT_IDS.iter().map(|id| c("Recent File", id)).collect();
                     v.push(Sep);
@@ -61,7 +62,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 c("Export Selection…", "file.exportSelection"),
                 Sep,
                 c("Package…", "ui.packageDialog"),
-                sub("Scripts", vec![c("Check Script…", "ui.checkScript"), todos("Other Script…", "Cmd+F12")]),
+                sub("Scripts", crate::scripts_menu::items()),
                 Sep,
                 c("Document Setup…", "file.documentSetup"),
                 sub(
@@ -96,7 +97,10 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 Sep,
                 cp("Find and Replace…", "edit.findReplace", json!({"find": "", "replace": "", "matchCase": false, "wholeWord": false})),
                 cp("Find Next", "edit.findNext", json!({"find": ""})),
-                sub("Spelling", vec![todo("Auto Spell Check"), todos("Check Spelling…", "Cmd+I"), todo("Edit Custom Dictionary…")]),
+                sub("Spelling", vec![c("Auto Spell Check", "edit.autoSpellCheck"), todos("Check Spelling…", "Cmd+I")]),
+                // Edit › Edit Custom Dictionary…, beside Spelling, on the public Check and correct
+                // spelling page.
+                c("Edit Custom Dictionary…", crate::dialogs::custom_dictionary::COMMAND),
                 Sep,
                 sub(
                     "Edit Colors",
@@ -117,6 +121,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                         c("Blend Vertically", "edit.colors.blendVertically"),
                         c("Convert to CMYK", "edit.colors.toCMYK"),
                         c("Convert to Grayscale", "edit.colors.toGrayscale"),
+                        c("Convert to Indexed Color…", "ui.indexedColorDialog"),
                         c("Convert to RGB", "edit.colors.toRGB"),
                         c("Invert Colors", "edit.colors.invert"),
                         cp(
@@ -170,7 +175,12 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 c("Unlock All", "object.unlockAll"),
                 sub(
                     "Hide",
-                    vec![c("Selection", "object.hide"), c("All Artwork Above", "object.hide.above"), c("Other Layers", "object.hide.otherLayers")],
+                    vec![
+                        c("Selection", "object.hide"),
+                        c("All Artwork Above", "object.hide.above"),
+                        c("Other Layers", "object.hide.otherLayers"),
+                        c("Unselected Artwork", "object.hide.unselected"),
+                    ],
                 ),
                 c("Show All", "object.showAll"),
                 Sep,
@@ -213,12 +223,14 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                     vec![
                         c("Join", "path.join"),
                         c("Average…", "path.average"),
+                        c("Average & Join…", "path.averageJoin"),
                         Sep,
                         c("Outline Stroke", "object.path.outlineStroke"),
                         c("Offset Path…", "object.path.offsetPath"),
                         c("Reverse Path Direction", "path.reverse"),
                         Sep,
                         c("Simplify…", "object.path.simplify"),
+                        c("Smooth…", "object.path.smooth"),
                         c("Add Anchor Points", "object.path.addAnchorPoints"),
                         c("Remove Anchor Points", "path.removeAnchors"),
                         c("Divide Objects Below", "object.path.divideObjectsBelow"),
@@ -360,7 +372,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                     ],
                 ),
                 Sep,
-                sub("Plug-ins", crate::dialogs::plugin::object_menu()),
+                sub("Plug-ins", [crate::addons::plugin_menu(), crate::dialogs::plugin::object_menu()].concat()),
             ],
         ),
         (
@@ -385,8 +397,23 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                     PATH_EFFECTS
                         .iter()
                         .map(|&(label, effect)| cp(label, "type.pathOptions", json!({ "effect": effect })))
-                        .chain([Sep, c("Type on a Path Options…", "type.pathOptions")])
+                        .chain([
+                            Sep,
+                            c("Center on Top", "type.pathCenter.top"),
+                            c("Center on Bottom", "type.pathCenter.bottom"),
+                            Sep,
+                            c("Type on a Path Options…", "type.pathOptions"),
+                        ])
                         .collect(),
+                ),
+                c("Dynamic Text", "type.dynamicText"),
+                sub(
+                    "Dynamic Text Presets",
+                    vec![
+                        cp("Circle", "type.dynamicTextPreset", json!({"preset": "circle"})),
+                        cp("Arch", "type.dynamicTextPreset", json!({"preset": "arch"})),
+                        cp("Bow", "type.dynamicTextPreset", json!({"preset": "bow"})),
+                    ],
                 ),
                 sub(
                     "Threaded Text",
@@ -399,6 +426,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 c("Fit Headline", "text.fitHeadline"),
                 Sep,
                 c("Find Font…", "type.findFont"),
+                c("Composite Fonts…", crate::dialogs::composite_fonts::COMMAND),
                 sub(
                     "Change Case",
                     vec![
@@ -455,6 +483,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                         c("Graphic Style", "select.same.graphicStyle"),
                         c("Shape", "select.same.shapeType"),
                         c("Symbol Instance", "select.same.symbolInstance"),
+                        c("Link Block Series", "select.same.linkBlockSeries"),
                         Sep,
                         c("Font Family", "select.same.fontFamily"),
                         c("Font Family & Style", "select.same.fontFamilyStyle"),
@@ -462,6 +491,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                         c("Font Size", "select.same.fontSize"),
                         c("Text Fill Color", "select.same.textFillColor"),
                         c("Text Stroke Color", "select.same.textStrokeColor"),
+                        c("Text Fill & Stroke Color", "select.same.textFillAndStrokeColor"),
                     ],
                 ),
                 sub(
@@ -476,6 +506,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                         c("Slices", "select.object.slices"),
                         c("Stray Points", "select.object.strayPoints"),
                         c("Open Paths", "select.object.openPaths"),
+                        c("Not Aligned to Pixel Grid", "select.object.notAlignedToPixelGrid"),
                         Sep,
                         c("All Text Objects", "select.object.textObjects"),
                         c("Point Text Objects", "select.object.pointText"),
@@ -597,18 +628,31 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
             v.extend(SAVED_VIEW_IDS.iter().map(|id| c("Saved View", id)));
             v
         }),
-        (
-            "Window",
-            vec![
+        ("Window", {
+            let mut window_items = vec![
                 c("New Window", "window.newWindow"),
-                sub("Arrange", vec![todo("Cascade"), todo("Tile"), todo("Float in Window"), todo("Consolidate All Windows")]),
+                sub(
+                    "Arrange",
+                    vec![
+                        c("Cascade", "window.arrange.cascade"),
+                        c("Tile", "window.arrange.tile"),
+                        c("Float in Window", "window.arrange.floatInWindow"),
+                        c("Float All in Windows", "window.arrange.floatAllInWindows"),
+                        c("Consolidate All Windows", "window.arrange.consolidateAllWindows"),
+                    ],
+                ),
                 sub("Workspace", crate::workspaces::menu_items()),
                 Sep,
                 c("Control", "window.control"),
+                c("Help Bar", "window.helpBar"),
                 c("Contextual Task Bar", "window.taskBar"),
                 c("Tools", "window.toolbar"),
-                sub("Toolbars", vec![c("Advanced", "window.toolbarAdvanced"), c("Double Column", "window.toolbarColumns")]),
+                sub("Toolbars", crate::custom_toolbars::menu_items()),
                 Sep,
+            ];
+            let lang = crate::i18n::current();
+            let mut panels = vec![
+                panel("3D and Materials", crate::panels::three_d::ID),
                 panel("Actions", "actions"),
                 panel("Align", "align"),
                 panel("Appearance", "appearance"),
@@ -620,6 +664,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 panel("Color", "color"),
                 panel("Color Guide", "colorGuide"),
                 panel("Color Themes", "colorThemes"),
+                panel("Color Wheel", crate::panels::color_wheel::ID),
                 panel("CSS Properties", crate::panels::css_properties::ID),
                 panel("Document Info", "docInfo"),
                 panel("Flattener Preview", crate::panels::flattener_preview::ID),
@@ -629,6 +674,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 panel("Image Trace", "imageTrace"),
                 panel("Info", "info"),
                 panel("Layers", "layers"),
+                cp("Learn", "window.learn", json!({})),
                 panel("Libraries", "libraries"),
                 panel("Links", crate::panels::links::ID),
                 panel("Magic Wand", "magicWand"),
@@ -636,6 +682,7 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 panel("Pathfinder", "pathfinder"),
                 panel("Pattern Options", "patternOptions"),
                 panel("Properties", "properties"),
+                panel("Script Console", crate::panels::script_console::ID),
                 panel("Separations Preview", "separations"),
                 panel("Stroke", "stroke"),
                 panel("SVG Interactivity", crate::panels::svg_interactivity::ID),
@@ -643,9 +690,8 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 panel("Symbols", "symbols"),
                 panel("Transform", "transform"),
                 panel("Transparency", "transparency"),
-                sub(
-                    "Type",
-                    vec![
+                sub("Type", {
+                    let mut type_items = vec![
                         panel("Character", "character"),
                         panel("Character Styles", "charStyles"),
                         panel("Glyphs", "glyphs"),
@@ -653,16 +699,25 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                         panel("Paragraph", "paragraph"),
                         panel("Paragraph Styles", "paraStyles"),
                         panel("Tabs", "tabs"),
-                    ],
-                ),
+                    ];
+                    sort_by_localized_label(&mut type_items, lang);
+                    type_items
+                }),
                 panel("Variables", crate::panels::variables::ID),
-                Sep,
+            ];
+            sort_by_localized_label(&mut panels, lang);
+            window_items.extend(panels);
+            window_items.push(Sep);
+            let mut lib_items = vec![
                 sub("Brush Libraries", crate::panels::brushes::window_menu()),
                 sub("Graphic Style Libraries", crate::panels::graphic_styles::window_menu()),
                 sub("Swatch Libraries", crate::panels::swatches::window_menu()),
                 sub("Symbol Libraries", crate::panels::symbols::window_menu()),
-            ],
-        ),
+            ];
+            sort_by_localized_label(&mut lib_items, lang);
+            window_items.extend(lib_items);
+            window_items
+        }),
         (
             "Help",
             vec![
@@ -673,6 +728,8 @@ pub fn menu_tree_named(english_names: bool) -> Vec<(&'static str, Vec<Item>)> {
                 Sep,
                 c("Search Commands…", "help.commandPalette"),
                 todos("VectorCraft Help…", "F1"),
+                c("Safe Mode…", "help.safeMode"),
+                c("Copy Troubleshooting Info", "help.copyTroubleshootingInfo"),
                 Sep,
                 c("Check for Updates…", "help.checkForUpdates"),
                 c("About VectorCraft", "help.about"),
@@ -708,4 +765,23 @@ pub(super) fn arrange_items() -> Vec<Item> {
         Sep,
         c("Send to Current Layer", "object.arrange.sendToCurrentLayer"),
     ]
+}
+
+/// Sort menu items alphabetically by their display label in `lang`, folding Latin accents so
+/// panels and submenus appear in the expected alphabetical order in every interface language (#4143).
+fn sort_by_localized_label(items: &mut [Item], lang: crate::i18n::Lang) {
+    items.sort_by_cached_key(|it| {
+        let label = match it {
+            Item::Cmd(l, id, _) => crate::i18n::tr_id(lang, id, l),
+            Item::Sub(l, _) | Item::Todo(l, _) | Item::Header(l) => crate::i18n::tr(lang, l),
+            Item::Sep => "",
+        };
+        (
+            crate::i18n::name_sort_key(label),
+            match it {
+                Item::Cmd(l, ..) | Item::Sub(l, ..) | Item::Todo(l, ..) | Item::Header(l) => *l,
+                Item::Sep => "",
+            },
+        )
+    });
 }

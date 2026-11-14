@@ -5,11 +5,10 @@
 //! `TextObject::wrap` (text space); the layout engine subtracts them from each line's span.
 
 use serde_json::{Value, json};
-use vectorcraft_doc::{Document, Node, NodeId, NodeKind, TextKind, TextWrap, WrapShape};
-use vectorcraft_geom::{PathData, shapes};
+use vectorcraft_doc::{Document, NodeId, NodeKind, TextWrap};
 
 use super::typecmd::refresh_bounds;
-use super::*;
+use super::{CommandSpec, EngineError, Result, Session, bool_or, checked_ids_or_selection, cmd, f64_or, has_selection};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -18,7 +17,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Make",
             ["Object", "Text Wrap"],
             None,
-            "{offset?: pt (6), invert?: bool, ids?} area type below the selected objects (same layer) wraps around them → {ids}",
+            "{offset?: pt (6), invert?: bool, ids?} area type below the selected objects (same layer) wraps around them; a negative offset (to -1000) lets the text that far into them → {ids}",
             has_selection,
             make
         ),
@@ -28,15 +27,19 @@ pub fn specs() -> Vec<CommandSpec> {
             "Text Wrap Options…",
             ["Object", "Text Wrap"],
             None,
-            "{offset?: pt, invert?: bool, ids?} set the options of the selected wrap objects; no options → the current {offset, invert}",
+            "{offset?: pt, invert?: bool, ids?} set the options of the selected wrap objects (offset -1000 to 1000; a negative one lets text into the objects); no options → the current {offset, invert}",
             has_selection,
             options
         ),
     ]
 }
 
+/// The Offset a wrap object takes, in points.
+pub const TEXT_WRAP_OFFSET_RANGE: std::ops::RangeInclusive<f64> = -1000.0..=1000.0;
+
 fn wrap_param(p: &Value, base: TextWrap) -> TextWrap {
-    TextWrap { offset: f64_or(p, "offset", base.offset).clamp(-1000.0, 1000.0), invert: bool_or(p, "invert", base.invert) }
+    let (lo, hi) = (*TEXT_WRAP_OFFSET_RANGE.start(), *TEXT_WRAP_OFFSET_RANGE.end());
+    TextWrap { offset: f64_or(p, "offset", base.offset).clamp(lo, hi), invert: bool_or(p, "invert", base.invert) }
 }
 
 fn make(s: &mut Session, p: &Value) -> Result<Value> {
@@ -100,96 +103,10 @@ fn options(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "offset": w.offset, "invert": w.invert }))
 }
 
-/// Outline of a wrap object in document coordinates: its paths, or its bounds for other art.
-fn outline(n: &Node, out: &mut PathData) {
-    match &n.kind {
-        NodeKind::Path { path, guide: false, .. } => {
-            out.subpaths.extend(path.subpaths.iter().filter(|sp| sp.closed || sp.anchors.len() > 2).cloned())
-        }
-        NodeKind::Compound { children, .. } | NodeKind::Group { children, clip: false } => {
-            for c in children.iter().filter(|c| c.visible) {
-                outline(c, out);
-            }
-        }
-        // A clip group wraps by its clipping path.
-        NodeKind::Group { children, clip: true } => {
-            if let Some(c) = children.first() {
-                outline(c, out);
-            }
-        }
-        _ => {
-            if let Some(b) = n.geometric_bounds() {
-                out.subpaths.extend(shapes::rectangle(b).subpaths);
-            }
-        }
-    }
-}
-
-enum Item<'a> {
-    Wrap(&'a Node),
-    Text(NodeId),
-}
-
-fn collect<'a>(n: &'a Node, out: &mut Vec<Item<'a>>) {
-    if !n.visible {
-        return;
-    }
-    if n.extras().wrap.is_some() && !matches!(n.kind, NodeKind::Layer { .. }) {
-        out.push(Item::Wrap(n));
-        return;
-    }
-    match &n.kind {
-        NodeKind::Text(t) if matches!(t.kind, TextKind::Area { .. }) => out.push(Item::Text(n.id)),
-        NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } => {
-            for c in children {
-                collect(c, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn any_wrap_state(n: &Node) -> bool {
-    n.extras().wrap.is_some()
-        || matches!(&n.kind, NodeKind::Text(t) if !t.wrap.is_empty())
-        || n.children().is_some_and(|ch| ch.iter().any(|c| any_wrap_state(c)))
-}
-
 /// Re-resolve the wrap shapes of every area text object (called after each edit).
-pub(crate) fn refresh(doc: &mut Document) {
-    if !doc.layers.iter().any(|l| any_wrap_state(l)) {
-        return;
-    }
-    let mut updates: Vec<(NodeId, Vec<WrapShape>)> = vec![];
-    for layer in &doc.layers {
-        let mut items = vec![];
-        collect(layer, &mut items);
-        for (i, it) in items.iter().enumerate() {
-            let Item::Text(id) = it else { continue };
-            let Some(NodeKind::Text(t)) = doc.node(*id).map(|n| &n.kind) else { continue };
-            let inv = t.xf.inverse();
-            let shapes: Vec<WrapShape> = items[i + 1..]
-                .iter()
-                .filter_map(|w| match w {
-                    Item::Wrap(n) => {
-                        let mut pd = PathData::default();
-                        outline(n, &mut pd);
-                        (!pd.is_empty()).then(|| {
-                            pd.transform(inv);
-                            WrapShape { path: pd, wrap: n.extras().wrap.unwrap_or_default() }
-                        })
-                    }
-                    Item::Text(_) => None,
-                })
-                .collect();
-            if shapes != t.wrap {
-                updates.push((*id, shapes));
-            }
-        }
-    }
-    for (id, shapes) in updates {
+pub(crate) fn refresh(before: &Document, doc: &mut Document) {
+    for id in vectorcraft_doc::text::resolve_wrap(Some(before), doc) {
         if let Some(NodeKind::Text(t)) = doc.node_mut(id).map(|n| &mut n.kind) {
-            t.wrap = shapes;
             refresh_bounds(t);
         }
     }
@@ -271,6 +188,33 @@ mod tests {
         s.execute("object.textWrap.make", &json!({})).unwrap();
         s.execute("object.arrange.sendToBack", &json!({})).unwrap();
         assert_eq!(lines(&s, t), plain);
+    }
+
+    /// A negative offset from Text Wrap Options lets the lines beside a wrap object run that far
+    /// into it, the options report it, and one undo puts back the offset before it.
+    #[test]
+    fn text_wrap_options_negative_offset_reflows_and_round_trips() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"width": 600, "height": 600})).unwrap();
+        let t = s
+            .execute("text.create", &json!({"x": 0, "y": 0, "text": "word ".repeat(200), "size": 12, "area": {"width": 400, "height": 400}}))
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let r = s.execute("shape.rectangle", &json!({"x": -50, "y": 50, "width": 250, "height": 100})).unwrap()["id"].as_u64().unwrap();
+        s.execute("select.set", &json!({"ids": [r]})).unwrap();
+        s.execute("object.textWrap.make", &json!({})).unwrap();
+        let beside = |s: &Session| lines(s, t).into_iter().filter(|l| l.0 > 1.0).map(|l| l.0).collect::<Vec<_>>();
+        assert!(!beside(&s).is_empty() && beside(&s).iter().all(|x| (x - 206.0).abs() < 1e-6), "{:?}", beside(&s));
+        assert_eq!(s.execute("object.textWrap.options", &json!({"offset": -20})).unwrap()["offset"], json!(-20.0));
+        assert!(!beside(&s).is_empty() && beside(&s).iter().all(|x| (x - 180.0).abs() < 1e-6), "{:?}", beside(&s));
+        assert_eq!(s.execute("object.textWrap.options", &json!({})).unwrap()["offset"], json!(-20.0));
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.execute("object.textWrap.options", &json!({})).unwrap()["offset"], json!(6.0));
+        assert!(beside(&s).iter().all(|x| (x - 206.0).abs() < 1e-6), "{:?}", beside(&s));
+        // An offset past -1000 is kept at -1000: the whole object lets text through.
+        assert_eq!(s.execute("object.textWrap.options", &json!({"offset": -5000})).unwrap()["offset"], json!(-1000.0));
+        assert!(lines(&s, t).iter().all(|l| l.0 < 1.0 && l.1 > 300.0));
     }
 
     #[test]

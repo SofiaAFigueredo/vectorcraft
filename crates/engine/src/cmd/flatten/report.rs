@@ -1,6 +1,9 @@
 use super::apply::{kept_work, opaque, plan, stroked};
 use super::options::FlattenOptions;
-use super::*;
+use super::{
+    Appearance, Color, Deserialize, Document, Node, NodeId, NodeKind, Paint, PathData, Rect, Result, Serialize, Session, Value, bad, isolated_doc,
+    json, roots_of, shape_node, str_param, targets,
+};
 
 /// The top-level objects among `ids` (or the selection), in paint order: layers stand for their
 /// contents; hidden and locked objects and clipping paths are left alone.
@@ -9,7 +12,9 @@ pub(super) fn target_roots(s: &Session, p: &Value) -> Result<Vec<NodeId>> {
     let mut ids = vec![];
     for id in targets(s, p)? {
         match d.node(id) {
-            Some(n) if n.is_layer() => ids.extend(n.children().into_iter().flatten().map(|c| c.id)),
+            // Ruler guides are not art: they stay where they are.
+            Some(n) if n.is_layer() => ids.extend(n.children().into_iter().flatten().filter(|c| !c.is_ruler_guide()).map(|c| c.id)),
+            Some(n) if n.is_ruler_guide() => {}
             Some(_) => ids.push(id),
             None => {}
         }

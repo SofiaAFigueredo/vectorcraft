@@ -1,7 +1,11 @@
 use super::common::{
-    dist_to_polyline, ids_json, path_mut, path_of, points_param, poly_bounds, replace_with_pieces, sibling_with, target_paths, usize_opt,
+    dist_to_polyline, fill_targets, ids_json, path_mut, path_of, points_param, poly_bounds, pressure_region, replace_with_pieces, samples_param,
+    sibling_with, size_pressure, target_paths, usize_opt,
 };
-use super::*;
+use super::{
+    Anchor, AnchorKind, Beside, BezPath, BoolOp, Cap, EngineError, FillRule, Join, NodeId, ParamCurve, PathData, Point, Result, Session, SubPath,
+    Value, bad, eraser_area, eraser_tip, f64_or, fill_contains, json, number_or, object_param, po,
+};
 
 /// Split a filled path into connected pieces (each outer contour with its holes).
 pub(in super::super) fn components(pd: &PathData) -> Vec<PathData> {
@@ -166,7 +170,7 @@ pub(in super::super) fn erase_outline(pd: &PathData, step: f64, remove: &dyn Fn(
 
 pub(super) fn split(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "path.split";
-    let id = id_param(p, "id").ok_or_else(|| bad(C, "missing id"))?;
+    let id = object_param(p, "id", C)?.ok_or_else(|| bad(C, "missing id"))?;
     let si = usize_opt(p, "subpath", C)?.unwrap_or(0);
     let anchor = usize_opt(p, "anchor", C)?;
     let seg = usize_opt(p, "segment", C)?;
@@ -196,9 +200,16 @@ pub(super) fn split(s: &mut Session, p: &Value) -> Result<Value> {
             _ => return Err(EngineError::Other("no such segment".into())),
         };
         let mut pieces = sp.cut_at(&std::collections::BTreeSet::from([k]));
+        // The cut leaves one of its two coincident end points selected, as `path.cutAtAnchors`
+        // does, so a Direct Selection drag pulls the path apart there.
+        let pick = |sel: &mut vectorcraft_doc::Selection, id: NodeId, si: usize| {
+            sel.clear();
+            sel.add(id);
+            sel.anchors.entry(id).or_default().insert((si, 0));
+        };
         if sp.closed {
             path.subpaths[si] = pieces.pop().ok_or_else(|| EngineError::Other("no such anchor".into()))?;
-            sel.set([id]);
+            pick(sel, id, si);
             return Ok(vec![id]);
         }
         let [left, right] = <[SubPath; 2]>::try_from(pieces).map_err(|_| EngineError::Other("cannot split an open path at its end point".into()))?;
@@ -207,12 +218,12 @@ pub(super) fn split(s: &mut Session, p: &Value) -> Result<Value> {
             let node = sibling_with(d, id, PathData::single(right))?;
             let (parent, idx, _) = d.position(id).ok_or(EngineError::NoNode(id))?;
             let nid = d.insert(parent, idx + 1, node)?;
-            sel.set([id, nid]);
+            pick(sel, nid, 0);
             Ok(vec![id, nid])
         } else {
             path.subpaths[si] = left;
             path.subpaths.insert(si + 1, right);
-            sel.set([id]);
+            pick(sel, id, si + 1);
             Ok(vec![id])
         }
     })?;
@@ -233,8 +244,7 @@ pub(super) fn knife(s: &mut Session, p: &Value) -> Result<Value> {
     let st = s.doc()?;
     let strip = po::outline_stroke(&PathData::single(SubPath::polyline(&pts, false)), KNIFE_GAP, Cap::Butt, Join::Round, 4.0);
     let mut plan: Vec<(NodeId, Vec<PathData>)> = vec![];
-    for id in target_paths(&st.doc, &st.selection, poly_bounds(&pts, 1.0)) {
-        let (pd, rule) = path_of(&st.doc, id)?;
+    for (id, pd, rule) in fill_targets(&st.doc, &st.selection, poly_bounds(&pts, 1.0))? {
         if !pd.is_closed() {
             continue;
         }
@@ -261,31 +271,47 @@ pub(super) fn knife(s: &mut Session, p: &Value) -> Result<Value> {
 
 pub(super) fn erase_region(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "path.eraseRegion";
-    let pts = points_param(p, "points", C)?;
+    let samples = samples_param(p, "points", C)?;
     let size = number_or(p, "size", 10.0, C)?;
     if !(size.is_finite() && size > 0.0) {
         return Err(bad(C, "size must be positive"));
     }
     let angle = number_or(p, "angle", 0.0, C)?;
     let roundness = number_or(p, "roundness", 100.0, C)?;
+    let pressure = size_pressure(p, &samples, C)?;
+    let pts: Vec<Point> = samples.into_iter().map(|s| s.pt).collect();
     let r = size / 2.0;
-    // The tip's short axis: an open path is sampled at least every half of it.
-    let short = size * roundness.clamp(1.0, 100.0) / 100.0;
+    // The tip's short axis (its narrowest with Pressure): an open path is sampled at least every half of it.
+    let narrowest = pressure.as_ref().map_or(size, |(_, v)| vectorcraft_tools::draw2::pressure_size(size, *v, 0.0));
+    let short = narrowest * roundness.clamp(1.0, 100.0) / 100.0;
     let st = s.doc()?;
-    let region = eraser_area(&pts, size, angle, roundness);
     // A point is under the tip when, with the tip squashed back into a circle, it is within the
     // circle's radius of the squashed drag.
-    let squash = eraser_tip(angle, roundness).inverse();
+    let stretch = eraser_tip(angle, roundness);
+    let squash = stretch.inverse();
     let round: Vec<Point> = pts.iter().map(|q| squash * *q).collect();
+    // With Size set to Pressure the tip is as wide as the pen pressed: the area is the squashed
+    // drag outlined at those widths, stretched back, and a point is under it when the area holds it.
+    let pressed = match (&pressure, round.len() > 1) {
+        (Some((prof, v)), true) => Some(pressure_region(&PathData::single(SubPath::polyline(&round, false)), size, *v, prof)?.transformed(stretch)),
+        (Some((prof, v)), false) => Some(eraser_area(&pts, vectorcraft_tools::draw2::pressure_size(size, *v, prof.at(0.0)), angle, roundness)),
+        (None, _) => None,
+    };
+    let reach = pressure.as_ref().map_or(r, |(_, v)| (size + v) / 2.0);
+    let region = pressed.clone().unwrap_or_else(|| eraser_area(&pts, size, angle, roundness));
+    let outline = pressed.map(|pd| pd.to_bezpath());
+    let under = |q: Point| match &outline {
+        Some(bp) => fill_contains(bp, FillRule::NonZero, q),
+        None => dist_to_polyline(&round, squash * q) <= r,
+    };
     let mut plan: Vec<(NodeId, Vec<PathData>)> = vec![];
-    for id in target_paths(&st.doc, &st.selection, poly_bounds(&pts, r)) {
-        let (pd, rule) = path_of(&st.doc, id)?;
+    for (id, pd, rule) in fill_targets(&st.doc, &st.selection, poly_bounds(&pts, reach))? {
         if pd.is_closed() {
             if po::area(&po::boolean(&pd, rule, &region, FillRule::NonZero, BoolOp::Intersect), FillRule::NonZero) <= 1e-6 {
                 continue;
             }
             plan.push((id, components(&po::boolean(&pd, rule, &region, FillRule::NonZero, BoolOp::Difference))));
-        } else if let Some(pieces) = erase_outline(&pd, short / 2.0, &|q| dist_to_polyline(&round, squash * q) <= r) {
+        } else if let Some(pieces) = erase_outline(&pd, short / 2.0, &under) {
             plan.push((id, pieces));
         }
     }

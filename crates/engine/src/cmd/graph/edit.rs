@@ -1,8 +1,21 @@
-use super::axis::{MAX_TICK_MARKS, count_param, one_line};
+use super::axis::{MAX_TICK_MARKS, count_given, one_line};
 use super::data::apply_data;
 use super::generate::{children_bounds, generate};
 use super::series::{picked_series, reselect_series};
-use super::*;
+use super::{
+    Affine, Document, EngineError, GraphKind, GraphSpec, Node, NodeId, Rect, Result, Session, TickLength, Value, ValueAxisSide, bad, f64_req, json,
+    named_id, number_or, switch_or, text_param,
+};
+
+/// An axis bound `p` gives for `key`: `None` when left out, `Some(None)` for null (calculated from the data), or the
+/// number. Any other value, such as `"10"`, is an error.
+fn bound_param(p: &Value, key: &str, cmd: &str) -> Result<Option<Option<f64>>> {
+    match p.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(v) => v.as_f64().map(|x| Some(Some(x))).ok_or_else(|| bad(cmd, format!("`{key}` must be a number or null, not {v}"))),
+    }
+}
 
 /// Regenerate graph `id` from `spec` (adjusting the plot rect for any move/scale since the last
 /// generation, which is recorded in the spec's `placed` bounds).
@@ -30,12 +43,14 @@ pub(super) fn regenerate(d: &mut Document, id: NodeId, mut spec: GraphSpec) -> R
 
 pub(super) fn create(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "graph.create";
-    let kind =
-        str_param(p, "type").map(|t| GraphKind::parse(t).ok_or_else(|| bad(C, format!("unknown graph type `{t}`")))).transpose()?.unwrap_or_default();
+    let kind = text_param(p, "type", C)?
+        .map(|t| GraphKind::parse(t).ok_or_else(|| bad(C, format!("unknown graph type `{t}`"))))
+        .transpose()?
+        .unwrap_or_default();
     let (x, y) = (f64_req(p, "x", C)?, f64_req(p, "y", C)?);
-    let (w, h) = (f64_or(p, "width", 200.0).abs().max(1.0), f64_or(p, "height", 150.0).abs().max(1.0));
+    let (w, h) = (number_or(p, "width", 200.0, C)?.abs().max(1.0), number_or(p, "height", 150.0, C)?.abs().max(1.0));
     let mut spec = GraphSpec { kind, rect: Rect::new(x, y, x + w, y + h), ..GraphSpec::default() };
-    if !apply_data(&mut spec, p) {
+    if !apply_data(&mut spec, p, C)? {
         // Starter data so the new graph shows something (edit it with Object → Graph → Data…).
         spec.series = vec!["Series 1".into(), "Series 2".into()];
         spec.categories = vec!["A".into(), "B".into(), "C".into(), "D".into()];
@@ -54,10 +69,18 @@ pub(super) fn create(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "id": id.0 }))
 }
 
-/// The selected graph (or the graph containing the selection).
+/// The graph `id` names (or the graph containing it), else the selected graph (or the graph
+/// containing the selection). Refused while an object of a dynamic symbol instance's art is
+/// selected.
 pub(super) fn target(s: &Session, p: &Value, cmd: &str) -> Result<NodeId> {
     let st = s.doc()?;
-    let start = id_param(p, "id").into_iter().chain(st.selection.objects.iter().copied());
+    let start = match named_id(p)? {
+        Some(id) => vec![id],
+        None => {
+            crate::cmd::edit::refuse_symbol_part(s)?;
+            st.selection.objects.clone()
+        }
+    };
     for id in start {
         let mut cur = Some(id);
         while let Some(c) = cur {
@@ -74,6 +97,60 @@ pub(super) fn spec_of(s: &Session, id: NodeId) -> Result<GraphSpec> {
     s.doc()?.doc.node(id).and_then(|n| n.extras().graph.as_deref().cloned()).ok_or(EngineError::NoNode(id))
 }
 
+fn query_type_options(spec: &GraphSpec, count: usize, picked: &[usize]) -> Value {
+    // With series picked, the type and value axis they share, so the dialog's OK keeps them.
+    let kinds: Vec<GraphKind> = picked.iter().map(|i| spec.series_kind(*i)).collect();
+    let kind = kinds.first().copied().filter(|k| kinds.iter().all(|x| x == k)).unwrap_or(spec.kind);
+    // Series on both axes give no value axis (null), so OK leaves each where it is.
+    let sides: Vec<bool> = picked.iter().map(|i| spec.right_series.binary_search(i).is_ok()).collect();
+    let value_axis = match sides.first() {
+        None => Some(spec.value_axis.id()),
+        Some(r) if sides.iter().all(|x| x == r) => Some(if *r { "right" } else { "left" }),
+        Some(_) => None,
+    };
+    let mut fields = json!({
+        "type": kind.id(), "columnWidth": spec.column_width, "clusterWidth": spec.cluster_width, "legend": spec.legend,
+        "markPoints": spec.mark_points, "connectPoints": spec.connect_points, "edgeToEdge": spec.edge_to_edge, "ticks": spec.ticks,
+        "axisMin": spec.axis_min, "axisMax": spec.axis_max, "valueAxis": value_axis, "separateScales": spec.separate_scales,
+        "rightTicks": spec.right_ticks, "rightAxisMin": spec.right_axis_min, "rightAxisMax": spec.right_axis_max,
+        "tickLength": spec.tick_length.id(), "tickMarks": spec.tick_marks.clamp(1, MAX_TICK_MARKS), "rightTickLength": spec.right_tick_length.id(),
+        "rightTickMarks": spec.right_tick_marks.clamp(1, MAX_TICK_MARKS), "categoryTickLength": spec.category_tick_length.id(),
+        "categoryTickMarks": spec.category_tick_marks.clamp(1, MAX_TICK_MARKS), "ticksBetweenLabels": spec.ticks_between_labels,
+        "prefix": one_line(&spec.prefix), "suffix": one_line(&spec.suffix), "rightPrefix": one_line(&spec.right_prefix),
+        "rightSuffix": one_line(&spec.right_suffix), "dropShadow": spec.drop_shadow, "legendAcrossTop": spec.legend_across_top,
+        "firstRowInFront": spec.first_row_in_front, "firstColumnInFront": spec.first_column_in_front, "filledLines": spec.filled_lines,
+    });
+    // Only the options this graph's types use: overlap order for columns and bars, filled lines for lines.
+    let kinds: Vec<GraphKind> = (0..count.max(1)).map(|i| spec.series_kind(i)).collect();
+    let has = |ks: &[GraphKind]| kinds.iter().any(|k| ks.contains(k));
+    if let Some(o) = fields.as_object_mut() {
+        if !has(&[GraphKind::Column, GraphKind::StackedColumn, GraphKind::Bar, GraphKind::StackedBar]) {
+            o.remove("firstRowInFront");
+            o.remove("firstColumnInFront");
+        }
+        if !has(&[GraphKind::Line, GraphKind::Scatter, GraphKind::Radar]) {
+            o.remove("filledLines");
+        }
+    }
+    // Pie graphs: Legend, Position and Sort (their Legend stands for the legend checkbox).
+    if let Some(o) = fields.as_object_mut().filter(|_| spec.kind == GraphKind::Pie) {
+        o.remove("legend");
+        o.insert(
+            "pieLegend".into(),
+            json!(if !spec.legend {
+                "none"
+            } else if spec.pie_legend_in_wedges {
+                "wedges"
+            } else {
+                "standard"
+            }),
+        );
+        o.insert("piePosition".into(), json!(spec.pie_position.id()));
+        o.insert("pieSort".into(), json!(spec.pie_sort.id()));
+    }
+    fields
+}
+
 pub(super) fn set_type(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "graph.setType";
     let id = target(s, p, C)?;
@@ -85,7 +162,8 @@ pub(super) fn set_type(s: &mut Session, p: &Value) -> Result<Value> {
     spec.right_series.retain(|i| *i < count);
     spec.right_series.sort_unstable();
     spec.right_series.dedup();
-    if p.get("seriesIndexes").is_some() && str_param(p, "type").is_none() && str_param(p, "valueAxis").is_none() {
+    let (new_type, new_axis) = (text_param(p, "type", C)?, text_param(p, "valueAxis", C)?);
+    if p.get("seriesIndexes").is_some() && new_type.is_none() && new_axis.is_none() {
         return Err(bad(C, "`seriesIndexes` needs a `type` or a `valueAxis`"));
     }
     let picked = picked_series(s, p, id, count, C)?;
@@ -127,61 +205,11 @@ pub(super) fn set_type(s: &mut Session, p: &Value) -> Result<Value> {
         "pieSort",
     ];
     if !keys.iter().any(|k| p.get(*k).is_some()) {
-        // With series picked, the type and value axis they share, so the dialog's OK keeps them.
-        let kinds: Vec<GraphKind> = picked.iter().map(|i| spec.series_kind(*i)).collect();
-        let kind = kinds.first().copied().filter(|k| kinds.iter().all(|x| x == k)).unwrap_or(spec.kind);
-        // Series on both axes give no value axis (null), so OK leaves each where it is.
-        let sides: Vec<bool> = picked.iter().map(|i| spec.right_series.binary_search(i).is_ok()).collect();
-        let value_axis = match sides.first() {
-            None => Some(spec.value_axis.id()),
-            Some(r) if sides.iter().all(|x| x == r) => Some(if *r { "right" } else { "left" }),
-            Some(_) => None,
-        };
-        let mut fields = json!({
-            "type": kind.id(), "columnWidth": spec.column_width, "clusterWidth": spec.cluster_width, "legend": spec.legend,
-            "markPoints": spec.mark_points, "connectPoints": spec.connect_points, "edgeToEdge": spec.edge_to_edge, "ticks": spec.ticks,
-            "axisMin": spec.axis_min, "axisMax": spec.axis_max, "valueAxis": value_axis, "separateScales": spec.separate_scales,
-            "rightTicks": spec.right_ticks, "rightAxisMin": spec.right_axis_min, "rightAxisMax": spec.right_axis_max,
-            "tickLength": spec.tick_length.id(), "tickMarks": spec.tick_marks.clamp(1, MAX_TICK_MARKS), "rightTickLength": spec.right_tick_length.id(),
-            "rightTickMarks": spec.right_tick_marks.clamp(1, MAX_TICK_MARKS), "categoryTickLength": spec.category_tick_length.id(),
-            "categoryTickMarks": spec.category_tick_marks.clamp(1, MAX_TICK_MARKS), "ticksBetweenLabels": spec.ticks_between_labels,
-            "prefix": one_line(&spec.prefix), "suffix": one_line(&spec.suffix), "rightPrefix": one_line(&spec.right_prefix),
-            "rightSuffix": one_line(&spec.right_suffix), "dropShadow": spec.drop_shadow, "legendAcrossTop": spec.legend_across_top,
-            "firstRowInFront": spec.first_row_in_front, "firstColumnInFront": spec.first_column_in_front, "filledLines": spec.filled_lines,
-        });
-        // Only the options this graph's types use: overlap order for columns and bars, filled lines for lines.
-        let kinds: Vec<GraphKind> = (0..count.max(1)).map(|i| spec.series_kind(i)).collect();
-        let has = |ks: &[GraphKind]| kinds.iter().any(|k| ks.contains(k));
-        if let Some(o) = fields.as_object_mut() {
-            if !has(&[GraphKind::Column, GraphKind::StackedColumn, GraphKind::Bar, GraphKind::StackedBar]) {
-                o.remove("firstRowInFront");
-                o.remove("firstColumnInFront");
-            }
-            if !has(&[GraphKind::Line, GraphKind::Scatter, GraphKind::Radar]) {
-                o.remove("filledLines");
-            }
-        }
-        // Pie graphs: Legend, Position and Sort (their Legend stands for the legend checkbox).
-        if let Some(o) = fields.as_object_mut().filter(|_| spec.kind == GraphKind::Pie) {
-            o.remove("legend");
-            o.insert(
-                "pieLegend".into(),
-                json!(if !spec.legend {
-                    "none"
-                } else if spec.pie_legend_in_wedges {
-                    "wedges"
-                } else {
-                    "standard"
-                }),
-            );
-            o.insert("piePosition".into(), json!(spec.pie_position.id()));
-            o.insert("pieSort".into(), json!(spec.pie_sort.id()));
-        }
-        return Ok(fields);
+        return Ok(query_type_options(&spec, count, &picked));
     }
     // Series picked with Group Selection stay selected through the regeneration (their groups are new nodes).
     let reselect: Vec<u32> = if p.get("seriesIndexes").is_none() { picked.iter().filter_map(|i| u32::try_from(*i).ok()).collect() } else { vec![] };
-    if let Some(t) = str_param(p, "type") {
+    if let Some(t) = new_type {
         let kind = GraphKind::parse(t).ok_or_else(|| bad(C, format!("unknown graph type `{t}`")))?;
         if picked.is_empty() {
             spec.kind = kind;
@@ -200,7 +228,7 @@ pub(super) fn set_type(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     }
-    if let Some(v) = str_param(p, "valueAxis") {
+    if let Some(v) = new_axis {
         let side = ValueAxisSide::parse(v).ok_or_else(|| bad(C, format!("unknown value axis `{v}` (left, right or both)")))?;
         if picked.is_empty() {
             spec.value_axis = side;
@@ -216,54 +244,58 @@ pub(super) fn set_type(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     }
-    spec.separate_scales = bool_or(p, "separateScales", spec.separate_scales);
+    spec.separate_scales = switch_or(p, "separateScales", spec.separate_scales, C)?;
     for (key, slot) in [
         ("tickLength", &mut spec.tick_length),
         ("rightTickLength", &mut spec.right_tick_length),
         ("categoryTickLength", &mut spec.category_tick_length),
     ] {
-        if let Some(v) = str_param(p, key) {
+        if let Some(v) = text_param(p, key, C)? {
             *slot = TickLength::parse(v).ok_or_else(|| bad(C, format!("unknown {key} `{v}` (none, short or full)")))?;
         }
     }
     for (key, slot) in
         [("tickMarks", &mut spec.tick_marks), ("rightTickMarks", &mut spec.right_tick_marks), ("categoryTickMarks", &mut spec.category_tick_marks)]
     {
-        *slot = count_param(p, key, MAX_TICK_MARKS as u64).map_or(*slot, |n| n.max(1));
+        *slot = count_given(p, key, MAX_TICK_MARKS as u64, C)?.map_or(*slot, |n| n.max(1));
     }
-    spec.ticks_between_labels = bool_or(p, "ticksBetweenLabels", spec.ticks_between_labels);
-    if let Some(v) = str_param(p, "piePosition") {
+    spec.ticks_between_labels = switch_or(p, "ticksBetweenLabels", spec.ticks_between_labels, C)?;
+    if let Some(v) = text_param(p, "piePosition", C)? {
         spec.pie_position =
             vectorcraft_doc::PiePosition::parse(v).ok_or_else(|| bad(C, format!("unknown piePosition `{v}` (even, ratio or stacked)")))?;
     }
-    if let Some(v) = str_param(p, "pieSort") {
+    if let Some(v) = text_param(p, "pieSort", C)? {
         spec.pie_sort = vectorcraft_doc::PieSort::parse(v).ok_or_else(|| bad(C, format!("unknown pieSort `{v}` (none, all or first)")))?;
     }
     for (key, slot) in
         [("prefix", &mut spec.prefix), ("suffix", &mut spec.suffix), ("rightPrefix", &mut spec.right_prefix), ("rightSuffix", &mut spec.right_suffix)]
     {
-        if let Some(v) = str_param(p, key) {
+        if let Some(v) = text_param(p, key, C)? {
             // A label, not a paragraph: one line, at most MAX_AFFIX characters.
             *slot = one_line(v);
         }
     }
-    spec.right_ticks = count_param(p, "rightTicks", 100).unwrap_or(spec.right_ticks);
-    if let Some(v) = p.get("rightAxisMin") {
-        spec.right_axis_min = v.as_f64();
+    spec.right_ticks = count_given(p, "rightTicks", 100, C)?.unwrap_or(spec.right_ticks);
+    for (key, slot) in [
+        ("rightAxisMin", &mut spec.right_axis_min),
+        ("rightAxisMax", &mut spec.right_axis_max),
+        ("axisMin", &mut spec.axis_min),
+        ("axisMax", &mut spec.axis_max),
+    ] {
+        if let Some(v) = bound_param(p, key, C)? {
+            *slot = v;
+        }
     }
-    if let Some(v) = p.get("rightAxisMax") {
-        spec.right_axis_max = v.as_f64();
-    }
-    spec.column_width = f64_or(p, "columnWidth", spec.column_width).clamp(1.0, 1000.0);
-    spec.cluster_width = f64_or(p, "clusterWidth", spec.cluster_width).clamp(1.0, 1000.0);
-    spec.legend = bool_or(p, "legend", spec.legend);
-    spec.drop_shadow = bool_or(p, "dropShadow", spec.drop_shadow);
-    spec.first_row_in_front = bool_or(p, "firstRowInFront", spec.first_row_in_front);
-    spec.first_column_in_front = bool_or(p, "firstColumnInFront", spec.first_column_in_front);
-    spec.filled_lines = bool_or(p, "filledLines", spec.filled_lines);
-    spec.legend_across_top = bool_or(p, "legendAcrossTop", spec.legend_across_top);
+    spec.column_width = number_or(p, "columnWidth", spec.column_width, C)?.clamp(1.0, 1000.0);
+    spec.cluster_width = number_or(p, "clusterWidth", spec.cluster_width, C)?.clamp(1.0, 1000.0);
+    spec.legend = switch_or(p, "legend", spec.legend, C)?;
+    spec.drop_shadow = switch_or(p, "dropShadow", spec.drop_shadow, C)?;
+    spec.first_row_in_front = switch_or(p, "firstRowInFront", spec.first_row_in_front, C)?;
+    spec.first_column_in_front = switch_or(p, "firstColumnInFront", spec.first_column_in_front, C)?;
+    spec.filled_lines = switch_or(p, "filledLines", spec.filled_lines, C)?;
+    spec.legend_across_top = switch_or(p, "legendAcrossTop", spec.legend_across_top, C)?;
     // After `legend`, which the Graph Type dialog sends too.
-    if let Some(v) = str_param(p, "pieLegend") {
+    if let Some(v) = text_param(p, "pieLegend", C)? {
         (spec.legend, spec.pie_legend_in_wedges) = match v.to_ascii_lowercase().as_str() {
             "none" => (false, false),
             "standard" => (true, false),
@@ -271,16 +303,10 @@ pub(super) fn set_type(s: &mut Session, p: &Value) -> Result<Value> {
             _ => return Err(bad(C, format!("unknown pieLegend `{v}` (none, standard or wedges)"))),
         };
     }
-    spec.mark_points = bool_or(p, "markPoints", spec.mark_points);
-    spec.connect_points = bool_or(p, "connectPoints", spec.connect_points);
-    spec.edge_to_edge = bool_or(p, "edgeToEdge", spec.edge_to_edge);
-    spec.ticks = count_param(p, "ticks", 100).unwrap_or(spec.ticks);
-    if let Some(v) = p.get("axisMin") {
-        spec.axis_min = v.as_f64();
-    }
-    if let Some(v) = p.get("axisMax") {
-        spec.axis_max = v.as_f64();
-    }
+    spec.mark_points = switch_or(p, "markPoints", spec.mark_points, C)?;
+    spec.connect_points = switch_or(p, "connectPoints", spec.connect_points, C)?;
+    spec.edge_to_edge = switch_or(p, "edgeToEdge", spec.edge_to_edge, C)?;
+    spec.ticks = count_given(p, "ticks", 100, C)?.unwrap_or(spec.ticks);
     let label = format!("{} Graph", spec.kind.label());
     s.edit("Graph Type", |d, sel| {
         regenerate(d, id, spec)?;

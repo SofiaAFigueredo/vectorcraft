@@ -1,5 +1,5 @@
 use super::kind::NodeKind;
-use super::*;
+use super::{BezPath, FillRule, Node, Outliner, Rect, shapes};
 
 /// Unites filled regions (each under its own fill rule) into one path filled non-zero. Booleans
 /// live above this crate (`vectorcraft-pathops`), so callers supply it.
@@ -19,7 +19,7 @@ impl Node {
 
     fn push_clip_shapes(&self, text: Outliner, out: &mut Vec<(BezPath, FillRule)>) {
         match &self.kind {
-            NodeKind::Path { guide: true, .. } | NodeKind::SymbolInstance { .. } => {}
+            NodeKind::Path { guide: true, .. } | NodeKind::RulerGuide { .. } | NodeKind::SymbolInstance { .. } => {}
             NodeKind::Path { path, rule, .. } => out.push((path.to_bezpath(), *rule)),
             NodeKind::Compound { children, rule } => {
                 let mut bp = BezPath::new();

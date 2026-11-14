@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Arc, CaptureEpoch, MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_TOTAL_BYTES, QueuedScreenshot, SCREENSHOT_SETTLE_FRAMES, SCREENSHOT_TIMEOUT_ERROR,
+    VectorcraftApp, file_access, json, now_ms,
+};
 use crate::control;
 
 impl VectorcraftApp {
@@ -154,9 +157,12 @@ impl VectorcraftApp {
                     let pending = self.pending_screenshots.remove(index);
                     self.screenshot_reserved = self.screenshot_reserved.saturating_sub(pending.reserved_bytes);
                     let roots = self.automation_roots.clone();
-                    let _ = pending
-                        .reply
-                        .send(file_access::confine(roots.as_ref(), || control::save_screenshot(self, &image, pending.path.as_deref(), pending.data)));
+                    let reply = file_access::confine(roots.as_ref(), || {
+                        let mut reply = control::save_screenshot(self, &image, pending.path.as_deref(), pending.data);
+                        control::hide_in_deferred_reply(self, &mut reply, &json!({"path": pending.path}));
+                        reply
+                    });
+                    let _ = pending.reply.send(reply);
                 }
                 Err(e) => {
                     let error = format!("the screenshot could not be used: {e}");

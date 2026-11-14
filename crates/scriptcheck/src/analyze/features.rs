@@ -1,6 +1,6 @@
 //! The platform features, menu commands and later syntax the analysis recognises.
 
-use super::*;
+use super::{Analyzer, FeatureId, NEWER, OutsideId, Pending, Sig, T, catalog, is, member_mark, newer_number, report, unquote, word};
 
 /// A global name of the platform the report looks for (`$`, `File`, `Socket`, `alert`, `eval`…).
 pub(super) fn platform_name(n: &str) -> bool {
@@ -156,8 +156,6 @@ impl<'s, 'a, 'l> Analyzer<'s, 'a, 'l> {
                 } else if n == catalog::DOLLAR_EVAL_FILE {
                     self.acc.feature(FeatureId::DollarEvalFile, line);
                     self.acc.outside(OutsideId::UnseenCode, line, None);
-                } else if n == catalog::LOCALIZE {
-                    self.acc.feature(FeatureId::Localize, line);
                 } else {
                     self.acc.feature(FeatureId::Dollar, line);
                 }

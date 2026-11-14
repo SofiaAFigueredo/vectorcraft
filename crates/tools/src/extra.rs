@@ -1,9 +1,12 @@
 //! Flare, Reshape, Shaper and Graph tools.
 //!
-//! Flare: drag sets the centre and its size (click without dragging opens the Flare Tool Options),
-//! then a click sets the end point of the rings; the rest comes from the tool's options (the Flare
-//! Tool Options, which last). Reshape: drag a point of a selected path; the engine's
-//! `path.reshape` adds an anchor there if needed and moves the neighbourhood smoothly.
+//! Flare: drag sets the center and its size and turns the rays as the pointer moves up or down
+//! (Shift holds their turn; click without dragging opens the Flare Tool Options), then a click
+//! sets the end point of the rings; Space held during either drag moves the flare. The rest comes
+//! from the tool's options (the Flare Tool Options, which last). Reshape: a click on a selected
+//! path sets a focal point (adding an anchor on a segment), Shift-click adds or removes more, and
+//! a drag from a focal point moves them all; the engine's `path.reshape` stretches the selected
+//! anchors between them and the anchors that stay.
 
 use serde_json::{Value, json};
 use vectorcraft_geom::{Point, Vec2};
@@ -51,9 +54,13 @@ pub struct FlareTool {
     /// Centre placed, waiting for the end-point click: (centre, diameter).
     placed: Option<(Point, f64)>,
     hover: Point,
+    /// The pointer at the last press or drag, from which Space held moves the flare.
+    last: Point,
     began: bool,
     /// Ray count changed with ↑/↓ during the gesture (None = the options' count).
     rays: Option<u64>,
+    /// The rays' turn (`shape.flare`'s `rotation`, degrees) the center drag set.
+    turn: f64,
     /// The options' values, in [`FLARE_OPTIONS`] order.
     values: [f64; 12],
     /// Whether the flare has rays and rings (the options' Rays and Rings checkboxes).
@@ -67,8 +74,10 @@ impl Default for FlareTool {
             drag: None,
             placed: None,
             hover: Point::ZERO,
+            last: Point::ZERO,
             began: false,
             rays: None,
+            turn: 0.0,
             values: FLARE_OPTIONS.map(|(_, default, _, _)| default),
             rays_on: true,
             rings_on: true,
@@ -101,12 +110,26 @@ pub fn flare_params(o: &Value, c: Point) -> Value {
     v
 }
 
+/// The chosen rotation rate: one degree per document point of vertical pointer travel.
+/// This is independent of pointer event frequency and elapsed time.
+const RAY_DEGREES_PER_POINT: f64 = 1.0;
+
+/// Accumulate travel rather than an event-count step. Frozen/moving samples still update
+/// the pointer baseline, so releasing a modifier never catches up skipped rotation.
+fn ray_turn(turn: f64, dy: f64, shift: bool) -> f64 {
+    if shift || !dy.is_finite() {
+        return turn;
+    }
+    (turn + dy * RAY_DEGREES_PER_POINT).rem_euclid(360.0)
+}
+
 impl FlareTool {
-    /// `shape.flare`'s params: the options, with the dragged centre and diameter, the ray count
-    /// ↑/↓ chose and the rings' end point once clicked.
+    /// `shape.flare`'s params: the options, with the dragged center and diameter, the rays' turn,
+    /// the ray count ↑/↓ chose and the rings' end point once clicked.
     fn params(&self, c: Point, diameter: f64, end: Option<Point>) -> Value {
         let mut v = flare_params(&self.options(), c);
         v["diameter"] = json!(diameter.max(1.0));
+        v["rotation"] = json!(self.turn);
         if let Some(r) = self.rays.filter(|_| self.rays_on) {
             v["rays"] = json!(r);
         }
@@ -132,12 +155,20 @@ impl Tool for FlareTool {
                 if self.placed.is_none() {
                     self.drag = Some((ev.pos, ev.pos));
                     self.rays = None;
+                    self.turn = 0.0;
                 }
+                self.last = ev.pos;
                 vec![]
             }
             PointerKind::Drag => {
-                if let Some((c, _)) = self.drag {
+                if let Some((mut c, _)) = self.drag {
+                    // Space held moves the center with the pointer, so the size and the turn stay.
+                    let dy = ev.pos.y - self.last.y;
+                    crate::shape::space_moves(&mut c, &mut self.last, ev, self.began);
                     self.drag = Some((c, ev.pos));
+                    if !ev.mods.space {
+                        self.turn = ray_turn(self.turn, dy, ev.mods.shift);
+                    }
                     if !self.began && ev.pos.distance(c) >= cx.tol(3.0) {
                         self.began = true;
                         return vec![
@@ -148,13 +179,17 @@ impl Tool for FlareTool {
                     if self.began {
                         return vec![Action::Preview("shape.flare".into(), self.params(c, 2.0 * ev.pos.distance(c), None))];
                     }
-                } else if let Some((c, d)) = self.placed {
+                } else if let Some((mut c, d)) = self.placed {
+                    // Space held moves the whole flare, rings' end point included.
+                    crate::shape::space_moves(&mut c, &mut self.last, ev, true);
+                    self.placed = Some((c, d));
                     return vec![Action::Preview("shape.flare".into(), self.params(c, d, Some(ev.pos)))];
                 }
                 vec![]
             }
             PointerKind::Up => {
-                if let Some((c, d)) = self.placed.take() {
+                if let Some((mut c, d)) = self.placed.take() {
+                    crate::shape::space_moves(&mut c, &mut self.last, ev, true);
                     self.began = false;
                     return vec![Action::Preview("shape.flare".into(), self.params(c, d, Some(ev.pos))), Action::Commit];
                 }
@@ -234,26 +269,141 @@ impl Tool for FlareTool {
     }
 }
 
-/// Reshape Tool: drag a point on a selected path.
+/// Where a Reshape press landed on a selected path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReshapeHit {
+    /// On an anchor: (subpath, anchor).
+    Anchor(usize, usize),
+    /// On a segment, away from its anchors: (subpath, the index of the anchor `path.reshape` adds
+    /// there).
+    Segment(usize, usize),
+}
+
+impl ReshapeHit {
+    /// The anchor the press grabs, as `(subpath, anchor)` once any anchor has been added.
+    fn anchor(self) -> (usize, usize) {
+        match self {
+            Self::Anchor(si, ai) | Self::Segment(si, ai) => (si, ai),
+        }
+    }
+
+    /// Where the anchor `r` is once the press has added its anchor: one further on after an
+    /// anchor added before it on its subpath.
+    fn renumber(self, r: (usize, usize)) -> (usize, usize) {
+        match self {
+            Self::Segment(si, added) if r.0 == si && r.1 >= added => (r.0, r.1.saturating_add(1)),
+            _ => r,
+        }
+    }
+}
+
+/// A Reshape press: the path, the point on it, what it landed on and whether Shift was held.
+#[derive(Clone, Debug)]
+struct ReshapePress {
+    id: vectorcraft_doc::NodeId,
+    at: Point,
+    hit: ReshapeHit,
+    shift: bool,
+    /// The drag so far.
+    d: Vec2,
+    /// The other focal points the drag moves, found when it starts, before the preview moves them.
+    others: Vec<((usize, usize), Point)>,
+}
+
+/// How near a focal point's stored position an anchor must be to be that focal point. An anchor
+/// added on a segment lies where the curve's point was found, to within rounding.
+const FOCAL_MATCH: f64 = 1e-6;
+
+/// A focal point: its `(subpath, anchor)` and where that anchor lies.
+type FocalPoint = ((usize, usize), Point);
+
+/// Reshape Tool: a click on a selected path makes the anchor or the point on a segment there the
+/// focal point (on a segment it adds an anchor), Shift-click adds or removes more, and a drag
+/// moves the focal points with the drag and stretches the selected anchors around them.
 #[derive(Default)]
 pub struct ReshapeTool {
-    /// (path, grab point) while dragging.
-    grab: Option<(vectorcraft_doc::NodeId, Point)>,
+    /// The press, until the button is released.
+    press: Option<ReshapePress>,
     began: bool,
     /// Pointer and offset readout while a reshape drag is in progress.
     measure: Option<(Point, String)>,
+    /// The focal points the tool highlighted: their path, and each one's `(subpath, anchor)` and
+    /// where that anchor lies. An anchor the tool adds before one renumbers it. A focal point
+    /// whose anchor no longer lies there (another edit moved or removed it) shows nothing and
+    /// moves nothing.
+    focal: Option<(vectorcraft_doc::NodeId, Vec<FocalPoint>)>,
 }
 
 impl ReshapeTool {
-    /// The selected path under `p` (Reshape works on selected paths only, like Illustrator).
-    fn hit(cx: &ToolContext, p: Point) -> Option<(vectorcraft_doc::NodeId, Point)> {
+    /// The selected path under `p` (Reshape works on selected paths only), the point on it and
+    /// what the point is.
+    fn hit(cx: &ToolContext, p: Point) -> Option<(vectorcraft_doc::NodeId, Point, ReshapeHit)> {
         let tol = cx.tol(4.0);
-        let editable = cx.doc.editable();
-        cx.selection.objects.iter().copied().filter(|id| editable(*id)).find_map(|id| {
+        Self::paths(cx).into_iter().find_map(|id| {
             let pd = cx.doc.node(id)?.path_data()?;
-            let (_, _, _, q, d) = pd.nearest(p)?;
-            (d <= tol).then_some((id, q))
+            let (si, seg, _, q, d) = pd.nearest(p)?;
+            if d > tol {
+                return None;
+            }
+            // `path.reshape` takes the anchor within `tol` of the point on the path.
+            let anchor = pd
+                .subpaths
+                .get(si)?
+                .anchors
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (i, a.p.distance(q)))
+                .filter(|&(_, dist)| dist <= tol)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            Some(match anchor {
+                Some((ai, _)) => (id, pd.subpaths.get(si)?.anchors.get(ai)?.p, ReshapeHit::Anchor(si, ai)),
+                // `SubPath::insert_anchor` puts the new anchor after the segment's first anchor.
+                None => (id, q, ReshapeHit::Segment(si, seg.saturating_add(1))),
+            })
         })
+    }
+
+    /// The paths Reshape works on: the selected paths that can be edited, in selection order.
+    fn paths(cx: &ToolContext) -> Vec<vectorcraft_doc::NodeId> {
+        let editable = cx.doc.editable();
+        cx.selection.objects.iter().copied().filter(|&id| editable(id) && cx.doc.node(id).is_some_and(|n| n.path_data().is_some())).collect()
+    }
+
+    /// The highlighted focal points of path `id` as `(subpath, anchor)`, with their positions: the
+    /// anchors of the path that lie where the tool stored them. None while Reshape does not work
+    /// on the path.
+    fn focal_points(&self, cx: &ToolContext, id: vectorcraft_doc::NodeId) -> Vec<((usize, usize), Point)> {
+        let Some((fid, points)) = &self.focal else { return vec![] };
+        if *fid != id || !Self::paths(cx).contains(&id) {
+            return vec![];
+        }
+        let Some(pd) = cx.doc.node(id).and_then(|n| n.path_data()) else { return vec![] };
+        let mut out: Vec<((usize, usize), Point)> = vec![];
+        for &((si, ai), p) in points {
+            let here = pd.subpaths.get(si).and_then(|sp| sp.anchors.get(ai)).map(|a| a.p);
+            if let Some(q) = here.filter(|q| q.distance(p) <= FOCAL_MATCH)
+                && !out.iter().any(|(o, _)| *o == (si, ai))
+            {
+                out.push(((si, ai), q));
+            }
+        }
+        out
+    }
+
+    /// The focal points other than the pressed point that a drag from `press` moves: all the
+    /// highlighted ones when the press is on one of them, else none (Shift only keeps the drag's
+    /// angle).
+    fn dragged_focal(&self, cx: &ToolContext, press: &ReshapePress) -> Vec<((usize, usize), Point)> {
+        let focal = self.focal_points(cx, press.id);
+        let pressed = |r: &(usize, usize)| matches!(press.hit, ReshapeHit::Anchor(si, ai) if (si, ai) == *r);
+        if focal.iter().any(|(r, _)| pressed(r)) { focal.into_iter().filter(|(r, _)| !pressed(r)).collect() } else { vec![] }
+    }
+
+    /// `path.reshape`'s params for `press` dragged by `d`.
+    fn params(cx: &ToolContext, press: &ReshapePress, d: Vec2) -> Value {
+        let others: Vec<[usize; 2]> = press.others.iter().map(|&((si, ai), _)| [si, ai]).collect();
+        // `focal` is sent when empty too: without it, `path.reshape` follows the earlier rule.
+        json!({ "id": press.id.0, "x": press.at.x, "y": press.at.y, "dx": d.x, "dy": d.y, "tol": cx.tol(4.0), "focal": others })
     }
 }
 
@@ -262,18 +412,19 @@ impl Tool for ReshapeTool {
         "reshape"
     }
     fn busy(&self) -> bool {
-        self.grab.is_some()
+        self.press.is_some()
     }
     fn pointer(&mut self, cx: &ToolContext, ev: &PointerEvent) -> Vec<Action> {
         match ev.kind {
             PointerKind::Down => {
-                self.grab = Self::hit(cx, ev.pos);
+                self.press =
+                    Self::hit(cx, ev.pos).map(|(id, at, hit)| ReshapePress { id, at, hit, shift: ev.mods.shift, d: Vec2::ZERO, others: vec![] });
                 self.began = false;
                 self.measure = None;
                 vec![]
             }
             PointerKind::Drag => {
-                let Some((id, at)) = self.grab else { return vec![] };
+                let Some(at) = self.press.as_ref().map(|p| p.at) else { return vec![] };
                 let mut d: Vec2 = ev.pos - at;
                 if ev.mods.shift {
                     d = vectorcraft_geom::constrain_angle_from(d, 45.0, cx.constrain_angle);
@@ -284,25 +435,58 @@ impl Tool for ReshapeTool {
                         return out;
                     }
                     self.began = true;
+                    let others = self.press.as_ref().map(|p| self.dragged_focal(cx, p)).unwrap_or_default();
+                    if let Some(p) = self.press.as_mut() {
+                        p.others = others;
+                    }
                     out.push(Action::Begin("Reshape".into()));
                 }
+                let Some(press) = self.press.as_mut() else { return out };
+                press.d = d;
                 self.measure = cx.measurement_labels.then(|| (ev.pos + Vec2::new(cx.tol(12.0), cx.tol(12.0)), cx.offset_label(d.x, d.y)));
-                out.push(Action::Preview(
-                    "path.reshape".into(),
-                    json!({ "id": id.0, "x": at.x, "y": at.y, "dx": d.x, "dy": d.y, "tol": cx.tol(4.0) }),
-                ));
+                out.push(Action::Preview("path.reshape".into(), Self::params(cx, press, d)));
                 out
             }
             PointerKind::Up => {
-                self.grab = None;
                 self.measure = None;
-                if std::mem::take(&mut self.began) { vec![Action::Commit] } else { vec![] }
+                let Some(press) = self.press.take() else { return vec![] };
+                if std::mem::take(&mut self.began) {
+                    // The focal points move with the whole drag, the grabbed point too, and are
+                    // renumbered after an anchor added on a segment.
+                    let mut points: Vec<((usize, usize), Point)> = press.others.iter().map(|&(r, p)| (press.hit.renumber(r), p + press.d)).collect();
+                    points.push((press.hit.anchor(), press.at + press.d));
+                    self.focal = Some((press.id, points));
+                    return vec![Action::Commit];
+                }
+                // A click: the point becomes the focal point, or with Shift is added to them or,
+                // when it is one already, removed.
+                let mut points: Vec<((usize, usize), Point)> = if press.shift { self.focal_points(cx, press.id) } else { vec![] };
+                let mut out = vec![];
+                match press.hit {
+                    ReshapeHit::Anchor(si, ai) => {
+                        let before = points.len();
+                        points.retain(|&(r, _)| r != (si, ai));
+                        if points.len() == before {
+                            points.push(((si, ai), press.at));
+                        }
+                    }
+                    ReshapeHit::Segment(..) => {
+                        // A reshape by no distance adds the anchor and keeps the selection as it is.
+                        out.push(Action::Exec("path.reshape".into(), Self::params(cx, &press, Vec2::ZERO)));
+                        for (r, _) in &mut points {
+                            *r = press.hit.renumber(*r);
+                        }
+                        points.push((press.hit.anchor(), press.at));
+                    }
+                }
+                self.focal = (!points.is_empty()).then_some((press.id, points));
+                out
             }
             _ => vec![],
         }
     }
     fn key(&mut self, _cx: &ToolContext, key: ToolKey, _mods: Mods) -> Vec<Action> {
-        if key == ToolKey::Escape && self.grab.take().is_some() {
+        if key == ToolKey::Escape && self.press.take().is_some() {
             self.measure = None;
             if std::mem::take(&mut self.began) {
                 return vec![Action::Cancel];
@@ -310,17 +494,30 @@ impl Tool for ReshapeTool {
         }
         vec![]
     }
+    fn deactivate(&mut self, _cx: &ToolContext) -> Vec<Action> {
+        self.focal = None;
+        self.measure = None;
+        if self.press.take().is_some() && std::mem::take(&mut self.began) { vec![Action::Cancel] } else { vec![] }
+    }
     fn overlays(&self, cx: &ToolContext) -> Vec<Overlay> {
+        let mut out = vec![];
+        // Each focal point: a filled anchor square inside a larger hollow one.
+        if let Some((id, _)) = &self.focal {
+            let color = cx.doc.layer_color(*id);
+            for (_, p) in self.focal_points(cx, *id) {
+                out.push(Overlay::Anchor { p, color, filled: false, size: 10.0 });
+                out.push(Overlay::Anchor { p, color, filled: true, size: 5.0 });
+            }
+        }
         if cx.measurement_labels
             && let Some((p, t)) = &self.measure
         {
-            vec![Overlay::Measure { p: *p, text: t.clone() }]
-        } else {
-            vec![]
+            out.push(Overlay::Measure { p: *p, text: t.clone() });
         }
+        out
     }
     fn cursor(&self, cx: &ToolContext, p: Point, _mods: Mods) -> Cursor {
-        if self.grab.is_some() || Self::hit(cx, p).is_some() { Cursor::Move } else { Cursor::Arrow }
+        if self.press.is_some() || Self::hit(cx, p).is_some() { Cursor::Move } else { Cursor::Arrow }
     }
 }
 
@@ -362,10 +559,11 @@ impl Tool for ShaperTool {
                 }
                 let pts = std::mem::take(&mut self.points);
                 if pts.first().is_some_and(|first| pts.iter().all(|p| p.distance(*first) < cx.tol(3.0))) {
-                    // In Construction mode a tap selects a source shape.
+                    // In Construction mode a tap selects a source shape. On a selected group, a tap on a
+                    // source shape's outline enters Construction mode.
                     let construction =
                         cx.isolation.and_then(|id| cx.doc.node(id)).is_some_and(|n| n.name.as_deref() == Some(vectorcraft_doc::shaper::SOURCES));
-                    let mut params = json!({"point": [ev.pos.x, ev.pos.y]});
+                    let mut params = json!({"point": [ev.pos.x, ev.pos.y], "tolerance": cx.tol(3.0).min(1000.0)});
                     if construction {
                         params["source"] = json!(true);
                     }
@@ -536,6 +734,109 @@ mod tests {
         assert_eq!(p["longest"].as_f64(), Some(300.0));
         t.set_option("raysOn", &json!(false));
         assert_eq!(t.params(Point::ZERO, 1.0, None)["rays"].as_u64(), Some(0));
+    }
+
+    /// The last `shape.flare` preview of `a`.
+    fn flare_preview(a: &[Action]) -> Value {
+        match a.iter().rev().find(|a| matches!(a, Action::Preview(..))) {
+            Some(Action::Preview(c, v)) if c == "shape.flare" => v.clone(),
+            other => panic!("no flare preview: {other:?}"),
+        }
+    }
+
+    /// Equal vertical travel gives equal rotation, regardless of event partitioning.
+    #[test]
+    fn flare_drag_turns_the_rays_and_shift_holds_their_turn() {
+        use crate::testutil::*;
+        use vectorcraft_doc::Selection;
+        let (d, _) = doc_with_rect();
+        let s = Selection::default();
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let shift = Mods { shift: true, ..Default::default() };
+        let space = Mods { space: true, ..Default::default() };
+        let mut results = vec![];
+        for steps in [1, 8, 64] {
+            let mut t = FlareTool::default();
+            t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 100.0, 100.0));
+            for i in 1..=steps {
+                t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 140.0, 100.0 + 80.0 * i as f64 / steps as f64));
+            }
+            assert_eq!(t.turn, 80.0);
+            t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 180.0, 180.0));
+            assert_eq!(t.turn, 80.0, "horizontal movement doesn't turn");
+            t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 180.0, 150.0));
+            assert_eq!(t.turn, 50.0, "reverse travel subtracts its distance");
+            let v = flare_preview(&t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 100.0, 200.0).with_mods(shift)));
+            assert_eq!(v["rotation"].as_f64(), Some(50.0));
+            assert_eq!(v["diameter"].as_f64(), Some(200.0));
+            t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 120.0, 220.0));
+            assert_eq!(t.turn, 70.0, "release does not catch up frozen movement");
+            t.key(&cx, ToolKey::Up, Mods::default());
+            assert_eq!(t.turn, 70.0);
+            t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 120.0, 220.0));
+            t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 300.0, 200.0));
+            let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 300.0, 260.0));
+            assert_eq!(a.last(), Some(&Action::Commit));
+            assert_eq!(flare_preview(&a)["rotation"].as_f64(), Some(70.0));
+            results.push(t.turn);
+        }
+        assert!(results.windows(2).all(|p| p[0] == p[1]));
+        // Space held before the first drag update freezes rotation too.
+        let mut t = FlareTool::default();
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 100.0, 100.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 140.0, 140.0).with_mods(space));
+        assert_eq!(t.turn, 0.0);
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 140.0, 150.0));
+        assert_eq!(t.turn, 10.0);
+    }
+
+    /// Space held while dragging out a flare moves it at its current size and turn, in the center
+    /// drag and in the drag that places the rings' end point; let go, the drag goes on from there.
+    #[test]
+    fn space_moves_the_flare_being_drawn() {
+        use crate::testutil::*;
+        use vectorcraft_doc::Selection;
+
+        let (d, _) = doc_with_rect();
+        let s = Selection::default();
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let space = Mods { space: true, ..Default::default() };
+        let step = 30.0;
+        let mut t = FlareTool::default();
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 100.0, 100.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 100.0, 130.0));
+        // Space held: the pointer's y grows, but the flare moves without turning.
+        let v = flare_preview(&t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 150.0, 180.0).with_mods(space)));
+        let at = |v: &Value| (v["cx"].as_f64(), v["cy"].as_f64(), v["diameter"].as_f64());
+        let turned = |v: &Value, by: f64| v["rotation"].as_f64().is_some_and(|r| (r - by).abs() < 1e-9);
+        assert_eq!(at(&v), (Some(150.0), Some(150.0), Some(60.0)));
+        assert!(turned(&v, step));
+        // Space let go: the size follows the pointer again, from the moved center, and so does the turn.
+        let v = flare_preview(&t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 150.0, 190.0)));
+        assert_eq!(at(&v), (Some(150.0), Some(150.0), Some(80.0)));
+        assert!(turned(&v, step + 10.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 150.0, 190.0));
+        // The second drag: Space held moves the flare, its rings' end point with it.
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Move, 300.0, 300.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 300.0, 300.0));
+        let v = flare_preview(&t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 320.0, 310.0).with_mods(space)));
+        assert_eq!((at(&v), v["x2"].as_f64(), v["y2"].as_f64()), ((Some(170.0), Some(160.0), Some(80.0)), Some(320.0), Some(310.0)));
+        assert!(turned(&v, step + 10.0));
+        let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 340.0, 310.0));
+        assert_eq!(a.last(), Some(&Action::Commit));
+        let v = flare_preview(&a);
+        assert_eq!((v["cx"].as_f64(), v["cy"].as_f64(), v["x2"].as_f64()), (Some(170.0), Some(160.0), Some(340.0)));
+        // A release with Space held away from the last drag moves the flare there too.
+        let mut t = FlareTool::default();
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 100.0, 100.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 130.0, 100.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 130.0, 100.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 300.0, 300.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 320.0, 300.0));
+        let v = flare_preview(&t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 340.0, 310.0).with_mods(space)));
+        assert_eq!((v["cx"].as_f64(), v["cy"].as_f64(), v["x2"].as_f64()), (Some(120.0), Some(110.0), Some(340.0)));
     }
 
     #[test]

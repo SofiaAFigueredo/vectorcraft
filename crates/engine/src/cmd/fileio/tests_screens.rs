@@ -148,6 +148,19 @@ fn device_names_and_trailing_periods_follow_windows_naming_rules() {
     assert_eq!(r["name"], "nul-.zip");
 }
 
+/// A dot in an artboard's name stays a dot (`example.artboard.png`, #6143); a name of only dots, or
+/// ending in one, still can't name another folder or end in a period, a leading dot is a dash (no
+/// hidden `.draft.png`), and `/` and `:` are dashes.
+#[test]
+fn an_artboard_name_keeps_its_dots() {
+    let mut s = session(7);
+    for (index, name) in ["example.artboard", "v1.2.final", "..", "a/b:c", "trail.", ".draft", "..x.y"].iter().enumerate() {
+        s.execute("artboard.setProps", &json!({"index": index, "name": name})).unwrap();
+    }
+    let r = export(&mut s, json!({"formats": [{"format": "png"}]}));
+    assert_eq!(names(&r), ["example.artboard.png", "v1.2.final.png", "Artboard-3.png", "a-b-c.png", "trail.png", "-draft.png", "--x.y.png"]);
+}
+
 /// `first_file` names the file the export writes first, for the same params: the item's file name,
 /// a prefix and a suffix with characters Windows does not allow, a range, a Windows device name,
 /// every kind of folder, presets, size suffixes, a name pattern with its counter and date, an
@@ -494,6 +507,22 @@ fn type_in_a_missing_family_is_named_once_for_every_format() {
     assert!(fallback[0].contains("Nonexistent Sans Probe"), "{fallback:?}");
 }
 
+/// What a later file loses comes before a note on the options that an earlier file gave: the
+/// first artboard's WebP gives only the lossy WebP note, the second's also says its type doesn't
+/// fit.
+#[test]
+fn what_any_file_loses_comes_before_the_notes_on_the_options() {
+    let mut s = session(2);
+    let second = s.doc().unwrap().doc.artboards[1].rect;
+    let area = json!({"width": 30, "height": 8});
+    s.execute("text.create", &json!({"x": second.x0 + 2.0, "y": second.y0 + 2.0, "size": 12, "area": area, "text": "Ab\nCd\nEf\nGh"})).unwrap();
+    let r = export(&mut s, json!({"formats": [{"format": "webp", "lossless": false}]}));
+    let warnings: Vec<&str> = r["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(warnings[0].contains("doesn't fit its frame"), "{warnings:?}");
+    assert!(warnings[1].starts_with("lossy WebP"), "{warnings:?}");
+}
+
 #[test]
 fn full_document_gives_one_file_per_format() {
     let mut s = session(3);
@@ -526,6 +555,20 @@ fn include_bleed_grows_each_artboard() {
     assert_eq!(size(&files(&r)[0].1), (40, 30), "without it, the artboard alone");
 }
 
+/// Include Bleed puts the bleed on a PDF/X row's page, so the row doesn't warn that it leaves the bleed out.
+#[test]
+fn include_bleed_pdfx_rows_do_not_warn_about_the_bleed() {
+    let mut s = session(1);
+    s.execute("document.setup", &json!({"bleed": 6})).unwrap();
+    let warned = |r: &Value| r["warnings"].as_array().unwrap().iter().any(|w| w == super::pdf::BLEED_LEFT_OUT);
+    let row = json!([{"format": "pdf", "standard": "pdfX4"}]);
+    assert!(warned(&export(&mut s, json!({"formats": row}))));
+    assert!(!warned(&export(&mut s, json!({"includeBleed": true, "formats": row}))));
+    // A selection is written on a page of its own bounds, which Include Bleed doesn't grow.
+    s.execute("shape.rectangle", &json!({"x": 5, "y": 5, "width": 10, "height": 10})).unwrap();
+    assert!(warned(&export(&mut s, json!({"includeBleed": true, "selection": "one", "formats": row}))));
+}
+
 #[test]
 fn png_8_rows_write_indexed_colour() {
     let mut s = session(1);
@@ -533,11 +576,298 @@ fn png_8_rows_write_indexed_colour() {
     let f = files(&r);
     // The IHDR colour type: 3 (indexed) for PNG 8, 6 (RGBA) for PNG; both are .png, the PNG 8 row
     // written first.
-    assert_eq!(names(&r), ["Artboard-1.png"], "the same file name: the first row wins");
-    assert_eq!(f[0].1[25], 3);
+    assert_eq!(names(&r), ["Artboard-1.png", "Artboard-1-2.png"], "the same file name: the second row's file is numbered");
+    assert_eq!((f[0].1[25], f[1].1[25]), (3, 6));
     let r = export(&mut s, json!({"formats": [{"format": "png8", "suffix": "-8"}, {"format": "png"}]}));
     let f = files(&r);
     assert_eq!((f[0].1[25], f[1].1[25]), (3, 6));
+}
+
+/// Without a name pattern, a row that writes a different file under a name another row's file
+/// already has gets `-2`, `-3`… as a name pattern's files do, compared without case; the first
+/// file keeps its name, and two identical rows still write one file.
+#[test]
+fn a_second_file_with_a_taken_name_is_numbered() {
+    let mut s = session(1);
+    let px = |png: &[u8]| image::load_from_memory(png).unwrap().to_rgba8().get_pixel(1, 1).0;
+    let rows = json!([{"format": "png", "background": "black"}, {"format": "png", "background": "white"}, {"format": "png", "background": "black"}]);
+    let r = export(&mut s, json!({ "formats": rows }));
+    assert_eq!(names(&r), ["Artboard-1.png", "Artboard-1-2.png"]);
+    let f = files(&r);
+    assert_eq!((px(&f[0].1), px(&f[1].1)), ([0, 0, 0, 255], [255, 255, 255, 255]));
+    // Row folders that differ only in case are one folder, spelled as the first row spells it.
+    let rows = json!([{"format": "png", "folder": "Print"}, {"format": "png", "folder": "print", "scale": 2, "suffix": ""}, {"format": "svg", "folder": "PRINT"}]);
+    let r = export(&mut s, json!({"subfolders": true, "formats": rows}));
+    assert_eq!(names(&r), ["Print/Artboard-1.png", "Print/Artboard-1-2.png", "Print/Artboard-1.svg"]);
+    assert_eq!(size(&files(&r)[1].1), (80, 60));
+}
+
+/// Names and folders that differ only in case match when a letter's lower case depends on where
+/// it stands: Greek `ΟΣ` lower-cases to `ος`, which a case-insensitive file system treats as `οσ`.
+#[test]
+fn names_that_differ_only_in_greek_sigmas_are_numbered() {
+    let mut s = session(2);
+    s.execute("artboard.setProps", &json!({"index": 0, "name": "ΟΣ"})).unwrap();
+    s.execute("artboard.setProps", &json!({"index": 1, "name": "οσ"})).unwrap();
+    let r = export(&mut s, json!({"name": "<name>", "formats": [{"format": "svg"}]}));
+    assert_eq!(names(&r), ["ΟΣ.svg", "οσ-2.svg"]);
+    let rows = json!([{"format": "png", "folder": "ΟΣ"}, {"format": "svg", "folder": "οσ"}]);
+    let r = export(&mut s, json!({"range": "1", "subfolders": true, "formats": rows}));
+    assert_eq!(names(&r), ["ΟΣ/ΟΣ.png", "ΟΣ/ΟΣ.svg"]);
+    // Each item still gets a folder of its own.
+    let r = export(&mut s, json!({"folders": "item", "formats": [{"format": "svg"}]}));
+    assert_eq!(names(&r), ["ΟΣ/ΟΣ.svg", "οσ-2/οσ-2.svg"]);
+    // Letters whose full upper case is two characters still match their other case.
+    s.execute("artboard.setProps", &json!({"index": 0, "name": "ᾀ"})).unwrap();
+    s.execute("artboard.setProps", &json!({"index": 1, "name": "ᾈ"})).unwrap();
+    let r = export(&mut s, json!({"name": "<name>", "formats": [{"format": "svg"}]}));
+    assert_eq!(names(&r), ["ᾀ.svg", "ᾈ-2.svg"]);
+    // So do names whose lower case is longer than the name: `İ` lower-cases to `i̇`.
+    s.execute("artboard.setProps", &json!({"index": 0, "name": "İ"})).unwrap();
+    s.execute("artboard.setProps", &json!({"index": 1, "name": "i\u{307}"})).unwrap();
+    let r = export(&mut s, json!({"name": "<name>", "formats": [{"format": "svg"}]}));
+    assert_eq!(names(&r), ["İ.svg", "i\u{307}-2.svg"]);
+}
+
+/// Dotless `ı` and dotted `İ` are letters of their own, as on NTFS and in Unicode case folding
+/// outside Turkic languages: names and folders spelled with them keep their own files, while `i`
+/// and `I` still match.
+#[test]
+fn dotless_and_dotted_i_are_not_plain_i() {
+    let mut s = session(4);
+    for (index, name) in ["i", "ı", "İ", "I"].into_iter().enumerate() {
+        s.execute("artboard.setProps", &json!({"index": index, "name": name})).unwrap();
+    }
+    let r = export(&mut s, json!({"name": "<name>", "formats": [{"format": "svg"}]}));
+    assert_eq!(names(&r), ["i.svg", "ı.svg", "İ.svg", "I-2.svg"]);
+    let rows = json!([{"format": "svg", "folder": "i"}, {"format": "svg", "folder": "ı"}, {"format": "svg", "folder": "İ"}, {"format": "svg", "folder": "I"}]);
+    let r = export(&mut s, json!({"range": "1", "subfolders": true, "formats": rows}));
+    assert_eq!(names(&r), ["i/i.svg", "ı/i.svg", "İ/i.svg"]);
+}
+
+/// A fresh folder for one test, emptied first and removed when dropped (also when an assertion
+/// fails).
+#[cfg(not(target_arch = "wasm32"))]
+struct Folder(std::path::PathBuf);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Folder {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("vc-screens-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Self(dir)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The numbered file is written beside the first one, and the reply lists both paths.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_numbered_file_is_written_into_the_first_rows_folder() {
+    let mut s = session(1);
+    let tmp = Folder::new("taken");
+    let dir = &tmp.0;
+    let folder = dir.to_string_lossy().replace('\\', "/");
+    let rows = json!([{"format": "png", "folder": "Print"}, {"format": "png", "folder": "print", "background": "white"}]);
+    let r = export(&mut s, json!({"folder": folder, "subfolders": true, "formats": rows}));
+    let written: Vec<&str> = r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
+    assert_eq!(written, [format!("{folder}/Print/Artboard-1.png"), format!("{folder}/Print/Artboard-1-2.png")]);
+    let entries: Vec<String> = std::fs::read_dir(dir.join("Print")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "one sub-folder");
+}
+
+/// An export into the folder an export preset keeps, for a client whose read roots don't hold that
+/// folder: the reply leaves out the ZIP's path and names the files relative to the folder. A folder
+/// inside the read roots, and one the client gives, stay whole.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_presets_folder_outside_the_read_root_is_left_out_of_the_reply() {
+    use crate::file_access::{AutomationRoots, confine};
+
+    let mut s = session(1);
+    let tmp = Folder::new("preset-roots");
+    let (inside, out) = (tmp.0.join("in"), tmp.0.join("out"));
+    for f in [&inside, &out] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let folder = out.to_string_lossy().replace('\\', "/");
+    let settings = json!({"formats": [{"format": "png", "folder": "1x"}], "subfolders": true, "folder": folder});
+    s.execute("document.exportPresets.save", &json!({"name": "Kept", "settings": settings})).unwrap();
+    let write_only = AutomationRoots::new(&[inside.as_path()], &[out.as_path()]).unwrap();
+    let both = AutomationRoots::new(&[inside.as_path(), out.as_path()], &[out.as_path()]).unwrap();
+    let run = |s: &mut Session, roots: &Option<std::sync::Arc<AutomationRoots>>, p: Value| confine(roots.as_ref(), || export(s, p));
+
+    let r = run(&mut s, &write_only, json!({"exportPreset": "Kept"}));
+    assert_eq!(r["files"], json!(["1x/Artboard-1.png"]), "{r}");
+    assert!(out.join("1x/Artboard-1.png").is_file());
+    let r = run(&mut s, &write_only, json!({"exportPreset": "Kept", "zip": true}));
+    assert_eq!((r.get("path"), &r["files"]), (None, &json!(["1x/Artboard-1.png"])), "{r}");
+    assert!(!r.to_string().contains(&folder), "{r}");
+    // Inside the read roots, or given by the client: whole.
+    assert_eq!(run(&mut s, &both, json!({"exportPreset": "Kept"}))["files"], json!([format!("{folder}/1x/Artboard-1.png")]));
+    let r = run(&mut s, &write_only, json!({"exportPreset": "Kept", "folder": folder, "zip": true}));
+    assert!(r["path"].as_str().is_some_and(|p| p.starts_with(&format!("{folder}/")) && p.ends_with(".zip")), "{r}");
+}
+
+/// An export into the folder an export preset keeps, refused because that folder is outside the
+/// client's read and write roots: the error names the folder by its name only. A folder the client
+/// gives stays whole in the error.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_refused_export_into_a_presets_folder_outside_the_read_root_names_it_by_its_name() {
+    use crate::file_access::{AutomationRoots, confine};
+
+    let mut s = session(1);
+    let tmp = Folder::new("preset-refused");
+    let (inside, out) = (tmp.0.join("in"), tmp.0.join("kept-out"));
+    for f in [&inside, &out] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let folder = out.to_string_lossy().replace('\\', "/");
+    let settings = json!({"formats": [{"format": "png"}], "folder": folder});
+    s.execute("document.exportPresets.save", &json!({"name": "Kept", "settings": settings})).unwrap();
+    let confined = AutomationRoots::new(&[inside.as_path()], &[inside.as_path()]).unwrap();
+    let mut run = |p: Value| confine(confined.as_ref(), || s.execute("document.exportForScreens", &p)).unwrap_err().to_string();
+
+    let e = run(json!({"exportPreset": "Kept"}));
+    assert!(e.contains("outside the write root") && e.contains("kept-out") && !e.contains(&folder), "{e}");
+    let e = run(json!({"exportPreset": "Kept", "folder": folder}));
+    assert!(e.contains(&folder), "{e}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "nothing written");
+    // A preset folder that holds the write root: the root stays whole in the error.
+    let parent = tmp.0.to_string_lossy().replace('\\', "/");
+    let settings = json!({"formats": [{"format": "png"}], "folder": parent});
+    s.execute("document.exportPresets.save", &json!({"name": "Parent", "settings": settings})).unwrap();
+    let e = confine(confined.as_ref(), || s.execute("document.exportForScreens", &json!({"exportPreset": "Parent"}))).unwrap_err().to_string();
+    let root = crate::cmd::findfiles::plain(inside.canonicalize().unwrap()).display().to_string();
+    let name = tmp.0.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(e.contains(&format!("root {root}: {name}")), "{e}");
+}
+
+/// A prepared export into the folder an export preset keeps, prepared for a client whose read roots
+/// don't hold that folder and written later outside that client's scope (as on the background
+/// thread): its reply leaves out the ZIP's path and names the files relative to the folder, and a
+/// refused write names the folder by its name. A folder inside the read roots, and one the client
+/// gives, stay whole.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_prepared_export_into_a_presets_folder_outside_the_read_root_leaves_it_out() {
+    use crate::file_access::{AutomationRoots, confine};
+
+    let mut s = session(1);
+    let tmp = Folder::new("prepared-roots");
+    let (inside, out) = (tmp.0.join("in"), tmp.0.join("kept-out"));
+    for f in [&inside, &out] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let folder = out.to_string_lossy().replace('\\', "/");
+    let settings = json!({"formats": [{"format": "png", "folder": "1x"}], "subfolders": true, "folder": folder});
+    s.execute("document.exportPresets.save", &json!({"name": "Kept", "settings": settings})).unwrap();
+    let write_only = AutomationRoots::new(&[inside.as_path()], &[out.as_path()]).unwrap();
+    let both = AutomationRoots::new(&[inside.as_path(), out.as_path()], &[out.as_path()]).unwrap();
+    let prepare = |s: &mut Session, roots: &Option<std::sync::Arc<AutomationRoots>>, p: Value| {
+        confine(roots.as_ref(), || s.prepare_screen_export("document.exportForScreens", &p)).unwrap()
+    };
+
+    let (r, files) = write_prepared(prepare(&mut s, &write_only, json!({"exportPreset": "Kept"})));
+    assert_eq!(r["files"], json!(["1x/Artboard-1.png"]), "{r}");
+    assert!(files.contains_key(&format!("{folder}/1x/Artboard-1.png")), "the files are written into the folder");
+    let (r, _) = write_prepared(prepare(&mut s, &write_only, json!({"exportPreset": "Kept", "zip": true})));
+    assert_eq!((r.get("path"), &r["files"]), (None, &json!(["1x/Artboard-1.png"])), "{r}");
+    assert!(!r.to_string().contains(&folder), "{r}");
+    // A refused write names the folder by its name.
+    let refused = prepare(&mut s, &write_only, json!({"exportPreset": "Kept"}));
+    let e = refused.write(&mut |path, _| Err(crate::EngineError::Other(format!("{path}: access denied")))).unwrap_err().to_string();
+    assert!(e.contains("kept-out/1x/Artboard-1.png: access denied") && !e.contains(&folder), "{e}");
+    // Inside the read roots, or given by the client: whole.
+    let (r, _) = write_prepared(prepare(&mut s, &both, json!({"exportPreset": "Kept"})));
+    assert_eq!(r["files"], json!([format!("{folder}/1x/Artboard-1.png")]), "{r}");
+    let (r, _) = write_prepared(prepare(&mut s, &write_only, json!({"exportPreset": "Kept", "folder": folder, "zip": true})));
+    assert!(r["path"].as_str().is_some_and(|p| p.starts_with(&format!("{folder}/")) && p.ends_with(".zip")), "{r}");
+    let given = prepare(&mut s, &write_only, json!({"exportPreset": "Kept", "folder": folder}));
+    let e = given.write(&mut |path, _| Err(crate::EngineError::Other(format!("{path}: access denied")))).unwrap_err().to_string();
+    assert!(e.contains(&folder), "{e}");
+}
+
+/// [`Session::screen_export_folder`]: the client's folder, else the one the export preset keeps,
+/// with its own name when the request's read roots don't hold it; none without a folder, for an
+/// unknown preset or for `assets.export`, which takes no preset.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_export_folder_is_the_clients_else_the_presets() {
+    use crate::file_access::{AutomationRoots, confine};
+
+    let mut s = session(1);
+    let tmp = Folder::new("export-folder");
+    let (inside, out) = (tmp.0.join("in"), tmp.0.join("kept-out"));
+    for f in [&inside, &out] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let folder = out.to_string_lossy().replace('\\', "/");
+    let settings = json!({"formats": [{"format": "png"}], "folder": folder});
+    s.execute("document.exportPresets.save", &json!({"name": "Kept", "settings": settings})).unwrap();
+    let confined = AutomationRoots::new(&[inside.as_path()], &[inside.as_path()]).unwrap();
+    let ask = |id: &str, p: Value| confine(confined.as_ref(), || s.screen_export_folder(id, &p));
+
+    let screens = "document.exportForScreens";
+    assert_eq!(ask(screens, json!({"exportPreset": "Kept"})), Some((folder.clone(), Some("kept-out".to_string()))));
+    assert_eq!(ask(screens, json!({"exportPreset": "Kept", "folder": "/x/y"})), Some(("/x/y".to_string(), None)));
+    assert_eq!(ask(screens, json!({"exportPreset": "Kept", "folder": ""})), None);
+    assert_eq!(ask(screens, json!({"exportPreset": "Nope"})), None);
+    assert_eq!(ask(screens, json!({})), None);
+    assert_eq!(ask("assets.export", json!({"exportPreset": "Kept"})), None);
+    assert_eq!(s.screen_export_folder(screens, &json!({"exportPreset": "Kept"})), Some((folder, None)), "unconfined: whole");
+}
+
+/// The export settings the document keeps and the saved presets, read by a client whose read roots
+/// don't hold their folder: `document.exportSettings`, `document.exportPresets.list` and
+/// `document.exportPresets.export` (as data and as a file) leave out that folder and keep the rest.
+/// Inside the read roots the folder stays.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn kept_settings_leave_out_a_folder_outside_the_read_root() {
+    use crate::file_access::{AutomationRoots, confine};
+
+    let mut s = session(1);
+    let tmp = Folder::new("settings-roots");
+    let (inside, out) = (tmp.0.join("in"), tmp.0.join("out"));
+    for f in [&inside, &out] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let folder = out.to_string_lossy().replace('\\', "/");
+    let settings = json!({"formats": [{"format": "svg"}], "folder": folder});
+    s.execute("document.exportPresets.save", &json!({"name": "Kept", "settings": settings})).unwrap();
+    export(&mut s, json!({"exportPreset": "Kept"}));
+    let confined = AutomationRoots::new(&[inside.as_path()], &[inside.as_path()]).unwrap();
+    let both = AutomationRoots::new(&[inside.as_path(), out.as_path()], &[inside.as_path()]).unwrap();
+    let ask = |s: &mut Session, roots: &Option<std::sync::Arc<AutomationRoots>>, cmd: &str, p: Value| {
+        confine(roots.as_ref(), || s.execute(cmd, &p).unwrap())
+    };
+    let saved = |list: &Value| list["presets"].as_array().unwrap().iter().find(|p| p["name"] == "Kept").unwrap()["settings"].clone();
+
+    let r = ask(&mut s, &confined, "document.exportSettings", json!({}));
+    assert_eq!((r["settings"].get("folder"), &r["settings"]["formats"]), (None, &json!([{"format": "svg"}])), "{r}");
+    let r = ask(&mut s, &confined, "document.exportPresets.list", json!({}));
+    assert_eq!(saved(&r), json!({"formats": [{"format": "svg"}]}), "{r}");
+    let r = ask(&mut s, &confined, "document.exportPresets.export", json!({"names": ["Kept"]}));
+    let data = r["data"].as_str().unwrap();
+    assert!(!data.contains(&folder) && data.contains("svg"), "{data}");
+    let file = inside.join("kept.vcexportpresets");
+    let path = file.to_string_lossy().replace('\\', "/");
+    ask(&mut s, &confined, "document.exportPresets.export", json!({"names": ["Kept"], "path": path}));
+    assert!(!std::fs::read_to_string(&file).unwrap().contains(&folder));
+
+    // Inside the read roots: whole.
+    assert_eq!(ask(&mut s, &both, "document.exportSettings", json!({}))["settings"]["folder"], json!(folder));
+    assert_eq!(saved(&ask(&mut s, &both, "document.exportPresets.list", json!({})))["folder"], json!(folder));
+    assert!(ask(&mut s, &both, "document.exportPresets.export", json!({"names": ["Kept"]}))["data"].as_str().unwrap().contains(&folder));
 }
 
 #[test]
@@ -634,6 +964,151 @@ fn zip_archives_store_their_files() {
     assert!(super::zip::entries(&broken).is_err(), "the CRC catches a changed byte");
 }
 
+/// The compression method of each file in `zip` (0: stored, 8: deflated), from its central directory.
+fn methods(zip: &[u8]) -> Vec<u16> {
+    let u16_at = |at: usize| usize::from(u16::from_le_bytes([zip[at], zip[at + 1]]));
+    let end = zip.len() - 22;
+    let mut at = u32::from_le_bytes(zip[end + 16..end + 20].try_into().unwrap()) as usize;
+    (0..u16_at(end + 10))
+        .map(|_| {
+            let method = u16_at(at + 10) as u16;
+            at += 46 + u16_at(at + 28) + u16_at(at + 30) + u16_at(at + 32);
+            method
+        })
+        .collect()
+}
+
+#[test]
+fn zip_archives_deflate_what_gets_smaller() {
+    // A xorshift run: bytes that deflating makes larger.
+    let mut x = 0x9E37_79B9u32;
+    let noise: Vec<u8> = (0..4096)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect();
+    let text = "<rect x=\"5\" y=\"5\" width=\"20\" height=\"20\"/>\n".repeat(100).into_bytes();
+    let files = [("art.svg", text.clone()), ("sub/ünï.png", noise.clone()), ("empty", vec![])];
+    let zip = super::zip::deflate(&files, super::zip::FIXED_TIME, || false).unwrap();
+    assert_eq!(methods(&zip), [8, 0, 0], "the text deflated, the noise and the empty file stored");
+    assert!(zip.windows(noise.len()).any(|w| w == noise.as_slice()), "a stored file's bytes are in the archive as they are");
+    assert!(zip.len() < super::zip::store(&files).unwrap().len());
+    let back = super::zip::entries(&zip).unwrap();
+    assert_eq!(back.len(), 3);
+    for ((n, b), (m, c)) in files.iter().zip(&back) {
+        assert_eq!((*n, b), (m.as_str(), c));
+    }
+    assert_eq!(super::zip::deflate(&files, super::zip::FIXED_TIME, || false).unwrap(), zip, "the same files, the same archive");
+}
+
+/// `deflate` asks `stop` before each chunk of a file and drops the archive when it answers true.
+#[test]
+fn zip_deflating_stops_between_chunks() {
+    let big = vec![7u8; 3 * super::zip::DEFLATE_CHUNK];
+    let files = [("a.bin", big.clone()), ("b.bin", big)];
+    let asked = std::cell::Cell::new(0);
+    let all = super::zip::deflate(&files, super::zip::FIXED_TIME, || {
+        asked.set(asked.get() + 1);
+        false
+    });
+    assert!(all.is_ok());
+    assert_eq!(asked.get(), 6, "once per chunk of each file");
+    asked.set(0);
+    let r = super::zip::deflate(&files, super::zip::FIXED_TIME, || {
+        asked.set(asked.get() + 1);
+        asked.get() == 2
+    });
+    assert!(r.is_err(), "stopped");
+    assert_eq!(asked.get(), 2, "nothing more is deflated after the stop");
+}
+
+/// A cancel that comes after the last file was encoded (here: during the last step, a row that
+/// repeats the one before it and writes nothing) returns no files and no archive, as it writes no
+/// archive into a folder.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_cancel_after_the_last_file_returns_nothing() {
+    let mut s = session(1);
+    let dir = std::env::temp_dir().join(format!("vc-screens-cancel-last-{}", std::process::id()));
+    let folder = dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    let rows = json!([{"format": "svg"}, {"format": "svg"}]);
+    for p in [json!({ "formats": rows }), json!({ "formats": rows, "zip": true }), json!({ "formats": rows, "zip": true, "folder": folder })] {
+        let prepared = s.prepare_screen_export("document.exportForScreens", &p).unwrap();
+        let token = vectorcraft_doc::cancel::CancelToken::new();
+        let on_last = token.clone();
+        let sink: vectorcraft_doc::cancel::ProgressSink = std::rc::Rc::new(move |done, total, _| {
+            if done + 1 == total {
+                on_last.cancel();
+            }
+        });
+        let mut written = vec![];
+        let r = vectorcraft_doc::cancel::scope(&token, Some(sink), || {
+            prepared.write(&mut |path: &str, _: &[u8]| {
+                written.push(path.to_string());
+                Ok(())
+            })
+        });
+        assert!(matches!(r, Err(crate::EngineError::Cancelled)), "{p}: {r:?}");
+        assert_eq!(written, Vec::<String>::new(), "{p}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A folder export without a ZIP writes each file as it goes: a cancel during the last step, a
+/// row that repeats the one before it and writes nothing, comes after every file was written, so
+/// the export returns the written files instead of the cancelled error.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_cancel_after_the_last_file_keeps_a_finished_folder_export() {
+    let mut s = session(1);
+    let dir = std::env::temp_dir().join(format!("vc-screens-cancel-folder-{}", std::process::id()));
+    let folder = dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    let p = json!({ "formats": [{"format": "svg"}, {"format": "svg"}], "folder": folder });
+    let prepared = s.prepare_screen_export("document.exportForScreens", &p).unwrap();
+    let token = vectorcraft_doc::cancel::CancelToken::new();
+    let on_last = token.clone();
+    let sink: vectorcraft_doc::cancel::ProgressSink = std::rc::Rc::new(move |done, total, _| {
+        if done + 1 == total {
+            on_last.cancel();
+        }
+    });
+    let mut written = vec![];
+    let r = vectorcraft_doc::cancel::scope(&token, Some(sink), || {
+        prepared.write(&mut |path: &str, _: &[u8]| {
+            written.push(path.to_string());
+            Ok(())
+        })
+    });
+    let r = r.unwrap();
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert_eq!(r["files"], json!(written));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn zip_exports_deflate_their_files() {
+    let mut s = session(1);
+    for i in 0..40 {
+        s.execute("shape.rectangle", &json!({"x": i % 30, "y": i % 20, "width": 8, "height": 6})).unwrap();
+    }
+    let p = json!({"formats": [{"format": "svg"}, {"format": "png"}]});
+    let plain = files(&export(&mut s, p.clone()));
+    let mut q = p;
+    q["zip"] = json!(true);
+    let r = export(&mut s, q);
+    let zip = b64(&r);
+    assert_eq!(super::zip::entries(&zip).unwrap(), plain, "every file comes back byte for byte");
+    let svg = plain.iter().position(|(n, _)| n.ends_with(".svg")).unwrap();
+    let png = plain.iter().position(|(n, _)| n.ends_with(".png")).unwrap();
+    let methods = methods(&zip);
+    assert_eq!((methods[svg], methods[png]), (8, 0), "the SVG deflated, the PNG stored");
+    assert!(zip.len() < super::zip::store(&plain).unwrap().len(), "smaller than the stored archive");
+    assert_eq!(r["bytes"].as_u64(), Some(zip.len() as u64));
+}
+
 #[test]
 fn the_document_remembers_its_export_settings() {
     let mut s = session(2);
@@ -665,4 +1140,116 @@ fn the_document_remembers_its_export_settings() {
     let plain = String::from_utf8(vectorcraft_format::save(&vectorcraft_doc::Document::new(5.0, 5.0), false)).unwrap();
     assert!(!plain.contains("export_settings") && !plain.contains("exportSettings"), "not written when empty");
     assert!(vectorcraft_format::load(plain.as_bytes()).unwrap().export_settings.is_empty());
+}
+
+/// Export PDFs As › Single file: with several artboards, a PDF row writes them as the pages of one
+/// file named after the document (raster rows still write a file per artboard); with one artboard
+/// the PDF is that artboard's, as Multiple files writes it.
+#[test]
+fn single_file_pdfs_hold_every_chosen_artboard() {
+    let mut s = session(3);
+    let title = s.doc().unwrap().doc.title.clone();
+    let rows = json!([{"format": "png", "scale": "1x"}, {"format": "pdf"}]);
+    let r = export(&mut s, json!({"range": "1-2", "pdfs": "single", "formats": rows}));
+    let got = files(&r);
+    let pdf: Vec<&(String, Vec<u8>)> = got.iter().filter(|(n, _)| n.ends_with(".pdf")).collect();
+    assert_eq!(pdf.len(), 1, "{:?}", names(&r));
+    assert_eq!(pdf[0].0, format!("{title}.pdf"));
+    assert_eq!(vectorcraft_pdf::import(&pdf[0].1).unwrap().artboards.len(), 2, "one page per artboard");
+    assert_eq!(got.iter().filter(|(n, _)| n.ends_with(".png")).count(), 2);
+    let r = export(&mut s, json!({"range": "2", "pdfs": "single", "formats": [{"format": "pdf"}]}));
+    assert_eq!(names(&r), ["Artboard-2.pdf"]);
+    let r = export(&mut s, json!({"range": "1-2", "pdfs": "multiple", "formats": [{"format": "pdf"}]}));
+    assert_eq!(names(&r), ["Artboard-1.pdf", "Artboard-2.pdf"]);
+    assert!(s.execute("document.exportForScreens", &json!({"pdfs": "both", "formats": [{"format": "pdf"}]})).is_err());
+}
+
+/// The warnings of reply `r` that name an option the file doesn't read.
+fn unused(r: &Value) -> Vec<String> {
+    r["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).filter(|w| w.contains("was not used")).map(str::to_string).collect()
+}
+
+/// An option of a format row, or of a format's settings, that only another format reads is
+/// accepted, and the reply's warnings name it as the request does, in the words of a save's note.
+#[test]
+fn a_row_option_only_another_format_reads_gets_a_note() {
+    let mut s = session(1);
+    let p = json!({
+        "formats": [{"format": "png", "quality": 80}, {"format": "jpg", "quality": 80}, {"format": "ai", "aiVersion": "7", "compress": true}],
+        "settings": {"png": {"quality": 50, "interlaced": true}, "svg": {"interlaced": true}},
+    });
+    let r = export(&mut s, p);
+    assert_eq!(
+        unused(&r),
+        [
+            "`formats[0].quality` was not used: PNG files don't read it",
+            "`formats[2].compress` was not used: legacy .ai (version 7) files don't read it",
+            "`settings.png.quality` was not used: PNG files don't read it",
+            "`settings.svg.interlaced` was not used: SVG files don't read it"
+        ],
+        "{r}"
+    );
+    // A row's own keys, the keys every row takes and the artboard choices get none.
+    let p = json!({"formats": [
+        {"format": "png", "scale": "2x", "suffix": "@2x", "folder": "x", "includeArtboardFill": false, "artboard": 0, "useArtboards": true},
+        {"format": "pdf", "marks": {"trim": true}, "preset": "High Quality Print"},
+        {"format": "vectorcraft", "compress": true, "range": "1"},
+    ]});
+    let r = export(&mut s, p);
+    assert!(unused(&r).is_empty(), "{r}");
+    // A format's settings are read as each row of that format writes them: a row can name another
+    // `.ai` version than the settings do.
+    let r = export(&mut s, json!({"formats": [{"format": "ai", "aiVersion": "7"}], "settings": {"ai": {"marks": {"trim": true}}}}));
+    assert_eq!(unused(&r), ["`settings.ai.marks` was not used: legacy .ai (version 7) files don't read it"], "{r}");
+    let r = export(&mut s, json!({"formats": [{"format": "ai", "aiVersion": "pdf"}], "settings": {"ai": {"aiVersion": "7", "compress": true}}}));
+    assert!(unused(&r).is_empty(), "{r}");
+    // A setting another row of the format reads gets none; one no row reads names the first row's
+    // file.
+    let rows = json!([{"format": "ai", "aiVersion": "7"}, {"format": "ai"}]);
+    let r = export(&mut s, json!({"formats": rows, "settings": {"ai": {"editingData": false}}}));
+    assert!(unused(&r).is_empty(), "{r}");
+    let r = export(&mut s, json!({"formats": rows, "settings": {"ai": {"quality": 80}}}));
+    assert_eq!(unused(&r), ["`settings.ai.quality` was not used: legacy .ai (version 7) files don't read it"], "{r}");
+    // A row that gives the key itself doesn't use the setting.
+    let rows = json!([{"format": "ai", "aiVersion": "7"}, {"format": "ai", "editingData": true}]);
+    let r = export(&mut s, json!({"formats": rows, "settings": {"ai": {"editingData": false}}}));
+    assert_eq!(unused(&r), ["`settings.ai.editingData` was not used: legacy .ai (version 7) files don't read it"], "{r}");
+    let rows = json!([{"format": "ai", "aiVersion": "7"}, {"format": "ai", "editingData": null}]);
+    let r = export(&mut s, json!({"formats": rows, "settings": {"ai": {"editingData": false}}}));
+    assert_eq!(unused(&r), ["`settings.ai.editingData` was not used: legacy .ai (version 7) files don't read it"], "{r}");
+    // An export writes one file per row and item: a native row doesn't read `separateArtboards`.
+    let r = export(&mut s, json!({"formats": [{"format": "vectorcraft", "separateArtboards": true}]}));
+    assert_eq!(unused(&r), ["`formats[0].separateArtboards` was not used: VectorCraft files don't read it"], "{r}");
+}
+
+/// The Asset Export panel's export notes the options of its request, not those of the settings
+/// the document remembers.
+#[test]
+fn an_asset_export_notes_the_options_it_is_given() {
+    let mut s = session(1);
+    s.execute("select.all", &json!({})).unwrap();
+    s.execute("assets.add", &json!({"multiple": false})).unwrap();
+    s.execute("assets.settings.set", &json!({"formats": [{"format": "png", "quality": 80}]})).unwrap();
+    let r = s.execute("assets.export", &json!({})).unwrap();
+    assert!(unused(&r).is_empty(), "{r}");
+    let r = s.execute("assets.export", &json!({"formats": [{"format": "svg", "quality": 80}]})).unwrap();
+    assert_eq!(unused(&r), ["`formats[0].quality` was not used: SVG files don't read it"], "{r}");
+    // Settings given are read as the remembered rows write them.
+    s.execute("assets.settings.set", &json!({"formats": [{"format": "ai", "aiVersion": "7"}]})).unwrap();
+    let r = s.execute("assets.export", &json!({"settings": {"ai": {"editingData": false}}})).unwrap();
+    assert_eq!(unused(&r), ["`settings.ai.editingData` was not used: legacy .ai (version 7) files don't read it"], "{r}");
+    s.execute("assets.settings.set", &json!({"formats": [{"format": "png", "quality": 80}]})).unwrap();
+    // So does the export a client prepares.
+    let p = json!({"formats": [{"format": "svg", "quality": 80}]});
+    let r = s.prepare_screen_export("assets.export", &p).unwrap().write(&mut |_: &str, _: &[u8]| Ok(())).unwrap();
+    assert_eq!(unused(&r), ["`formats[0].quality` was not used: SVG files don't read it"], "{r}");
+}
+
+/// A preset's options add no notes: Export for Screens notes the options of its request.
+#[test]
+fn an_export_preset_adds_no_notes() {
+    let mut s = session(1);
+    s.execute("document.exportPresets.save", &json!({"name": "Mixed", "settings": {"formats": [{"format": "png", "quality": 80}]}})).unwrap();
+    let r = export(&mut s, json!({"exportPreset": "Mixed"}));
+    assert!(unused(&r).is_empty(), "{r}");
 }
